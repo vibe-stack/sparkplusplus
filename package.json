@@ -1,0 +1,14 @@
+{
+  "name": "sparkplusplus",
+  "private": true,
+  "packageManager": "bun@1.3.0",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "dev": "cd apps/playground && bun run dev",
+    "build": "cd packages/spark && bun run build && cd ../../apps/playground && bun run build",
+    "typecheck": "cd packages/spark && bun run typecheck && cd ../../apps/playground && bun run typecheck"
+  }
+}

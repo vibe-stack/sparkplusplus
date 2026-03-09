@@ -1,0 +1,90 @@
+:root {
+  color-scheme: dark;
+  font-family: "Space Grotesk", "Avenir Next", sans-serif;
+  background:
+    radial-gradient(circle at top, rgba(120, 255, 214, 0.16), transparent 40%),
+    linear-gradient(160deg, #07111f 0%, #0f172a 45%, #050816 100%);
+  color: #e2f0ff;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+}
+
+.shell {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+}
+
+.panel {
+  width: min(720px, 100%);
+  padding: 32px;
+  border: 1px solid rgba(226, 240, 255, 0.12);
+  border-radius: 28px;
+  background: rgba(7, 17, 31, 0.75);
+  backdrop-filter: blur(18px);
+  box-shadow: 0 28px 80px rgba(0, 0, 0, 0.3);
+}
+
+.eyebrow {
+  margin: 0 0 12px;
+  color: #7cf2cf;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  font-size: 0.78rem;
+}
+
+h1 {
+  margin: 0;
+  font-size: clamp(2.4rem, 6vw, 4.8rem);
+  line-height: 0.95;
+}
+
+.body {
+  margin: 20px 0 0;
+  max-width: 52ch;
+  color: rgba(226, 240, 255, 0.82);
+  line-height: 1.6;
+}
+
+.facts {
+  margin: 28px 0 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 16px;
+}
+
+.facts div {
+  padding: 16px;
+  border-radius: 18px;
+  background: rgba(124, 242, 207, 0.08);
+  border: 1px solid rgba(124, 242, 207, 0.16);
+}
+
+dt {
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: rgba(226, 240, 255, 0.58);
+}
+
+dd {
+  margin: 8px 0 0;
+  font-size: 1rem;
+  color: #f6fbff;
+}
+
+@media (max-width: 640px) {
+  .panel {
+    padding: 24px;
+    border-radius: 22px;
+  }
+}
