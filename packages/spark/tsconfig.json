@@ -1,6 +1,15 @@
 {
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "three": [
+        "../../node_modules/@types/three/index.d.ts"
+      ],
+      "three/*": [
+        "../../node_modules/@types/three/*"
+      ]
+    },
     "rootDir": "./src",
     "outDir": "./dist",
     "declaration": true,

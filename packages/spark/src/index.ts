@@ -1,15 +1,19 @@
-export interface SparkEngineDescriptor {
-  name: string;
-  renderer: 'three-webgpu';
-  stage: 'bootstrap';
-}
-
-export const SPARK_ENGINE_DESCRIPTOR: SparkEngineDescriptor = {
-  name: 'Spark++',
-  renderer: 'three-webgpu',
-  stage: 'bootstrap',
-};
-
-export function getSparkBanner(): string {
-  return `${SPARK_ENGINE_DESCRIPTOR.name} (${SPARK_ENGINE_DESCRIPTOR.renderer})`;
-}
+export * from './assets/model';
+export * from './assets/page-table';
+export * from './assets/procedural-source';
+export * from './assets/spz-source';
+export * from './core/budgets';
+export * from './core/engine';
+export * from './core/frame-graph';
+export * from './core/governor';
+export * from './core/layouts';
+export * from './core/scene-descriptor';
+export * from './core/semantics';
+export * from './core/stats';
+export * from './scheduler/bootstrap-scheduler';
+export * from './scene/effects';
+export * from './scene/material';
+export * from './scene/renderer-bridge';
+export * from './scene/source';
+export * from './scene/splat-mesh';
+export * from './scene/splat-skinned-mesh';

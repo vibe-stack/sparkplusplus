@@ -8,6 +8,12 @@
       "DOM.Iterable"
     ],
     "paths": {
+      "three": [
+        "../../node_modules/@types/three/index.d.ts"
+      ],
+      "three/*": [
+        "../../node_modules/@types/three/*"
+      ],
       "@sparkplusplus/spark": [
         "../../packages/spark/src/index.ts"
       ]
