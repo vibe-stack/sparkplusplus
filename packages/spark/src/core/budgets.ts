@@ -15,19 +15,19 @@ export interface SplatBudgetOptions {
 }
 
 export const DEFAULT_SPLAT_BUDGETS: SplatBudgetOptions = {
-  maxVisibleSplats: 7_500,
-  maxOverdrawBudget: 1_200,
-  maxActivePages: 18,
-  maxResidentPages: 32,
+  maxVisibleSplats: 24_000,
+  maxOverdrawBudget: 1_800,
+  maxActivePages: 36,
+  maxResidentPages: 96,
   maxDeformablePages: 4,
-  maxPageUploadsPerFrame: 3,
-  minProjectedNodeSizePx: 64,
+  maxPageUploadsPerFrame: 8,
+  minProjectedNodeSizePx: 44,
   peripheralFoveation: 1,
-  heroTileBudget: 2,
+  heroTileBudget: 3,
   effectUpdateCadence: 1,
   deformationBudget: 1,
   renderScale: 1,
-  temporalStabilityBias: 1.15,
+  temporalStabilityBias: 1.3,
 };
 
 export function cloneBudgets(

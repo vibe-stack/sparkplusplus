@@ -11,6 +11,8 @@ import { SplatPageResidencyState } from '../assets/page-table';
 import { hasSemanticFlag } from '../core/semantics';
 import type { SplatBudgetOptions } from '../core/budgets';
 import type { SplatSceneObjectDescriptor } from '../core/scene-descriptor';
+import type { SplatSchedulerMode } from '../core/stats';
+import type { SplatGpuVisibilityReadback } from '../gpu/visibility';
 
 interface ClusterCandidate {
   descriptor: SplatSceneObjectDescriptor;
@@ -18,6 +20,23 @@ interface ClusterCandidate {
   score: number;
   projectedSizePx: number;
   screenRadius: number;
+  visibleCost: number;
+}
+
+interface FrontierBudgetState {
+  reservedPageSlots: number;
+  reservedVisibleSplats: number;
+  reservedOverdraw: number;
+}
+
+interface FrontierRefinementOption {
+  descriptor: SplatSceneObjectDescriptor;
+  parent: ClusterCandidate;
+  children: ClusterCandidate[];
+  deltaPageSlots: number;
+  deltaVisibleSplats: number;
+  deltaOverdraw: number;
+  priority: number;
 }
 
 export interface SplatActiveCluster {
@@ -38,6 +57,7 @@ export interface SplatMeshSelection {
 
 export interface SplatSceneSelection {
   meshSelections: Map<string, SplatMeshSelection>;
+  schedulerMode: SplatSchedulerMode;
   frontierClusters: number;
   visibleSplats: number;
   activePages: number;
@@ -64,6 +84,12 @@ export class BootstrapVisibilityScheduler {
   private readonly worldCenter = new Vector3();
   private readonly projectedCenter = new Vector3();
   private readonly sphere = new Sphere();
+  private readonly previousCameraPosition = new Vector3();
+  private readonly currentCameraPosition = new Vector3();
+  private readonly previousCameraForward = new Vector3();
+  private readonly currentCameraForward = new Vector3();
+  private hasPreviousCameraState = false;
+  private cameraMotionFactor = 0;
 
   evaluateScene(options: {
     objects: readonly SplatSceneObjectDescriptor[];
@@ -71,13 +97,29 @@ export class BootstrapVisibilityScheduler {
     viewportHeight: number;
     frameIndex: number;
     budgets: SplatBudgetOptions;
+    gpuVisibility?: SplatGpuVisibilityReadback;
   }): SplatSceneSelection {
-    const { objects, camera, viewportHeight, frameIndex, budgets } = options;
+    const { objects, camera, viewportHeight, frameIndex, budgets, gpuVisibility } = options;
+    this.cameraMotionFactor = this.measureCameraMotion(camera);
+    // Always accept GPU data up to 1 frame old.  GPU readback is async and is
+    // never 0-lag; requiring 0-lag during motion meant the GPU path was NEVER
+    // used while the camera was moving, permanently falling back to the slower
+    // CPU refinement path.
+    const acceptableGpuLagFrames = 1;
+    const effectiveGpuVisibility = gpuVisibility && frameIndex - gpuVisibility.frameIndex <= acceptableGpuLagFrames
+      ? gpuVisibility
+      : undefined;
     const meshSelections = new Map<string, SplatMeshSelection>();
-    const candidates: ClusterCandidate[] = [];
-    let reservedPageSlots = 0;
-    let reservedVisibleSplats = 0;
-    let reservedOverdraw = 0;
+    const frontierCandidates = new Map<string, Map<number, ClusterCandidate>>();
+    const rootCandidates: ClusterCandidate[] = [];
+    const frontierBudgetState: FrontierBudgetState = {
+      reservedPageSlots: 0,
+      reservedVisibleSplats: 0,
+      reservedOverdraw: 0,
+    };
+    const schedulerMode: SplatSchedulerMode = effectiveGpuVisibility?.ready === true
+      ? 'gpu-readback'
+      : 'cpu-bootstrap';
 
     camera.updateMatrixWorld();
     this.projectionMatrix.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
@@ -94,71 +136,65 @@ export class BootstrapVisibilityScheduler {
         activePageIds: [],
         requestedPageIds: [],
       });
+      frontierCandidates.set(mesh.uuid, new Map());
 
-      candidates.push(
-        ...asset.rootClusterIds
-          .map((clusterId) =>
-            this.scoreCandidate(descriptor, clusterId, camera, viewportHeight, pageTable, budgets),
-          )
-          .filter((candidate): candidate is ClusterCandidate => candidate !== null),
+      rootCandidates.push(
+        ...this.collectSeedCandidates(
+          descriptor,
+          camera,
+          viewportHeight,
+          pageTable,
+          budgets,
+          effectiveGpuVisibility,
+        ),
       );
     });
 
-    while (candidates.length > 0) {
-      candidates.sort((left, right) => right.score - left.score);
-      const candidate = candidates.shift()!;
-      const { descriptor, clusterId, projectedSizePx, screenRadius } = candidate;
-      const mesh = descriptor.mesh;
-      const asset = mesh.getAsset();
-      const pageTable = mesh.getPageTable();
-      const cluster = asset.clusters[clusterId]!;
-      const meshSelection = meshSelections.get(mesh.uuid)!;
-      const previouslySelected = mesh.getPreviousFrontierClusterIds().includes(clusterId);
+    if (effectiveGpuVisibility?.ready === true) {
+      this.buildGpuFrontier({
+        objects,
+        camera,
+        viewportHeight,
+        budgets,
+        gpuVisibility: effectiveGpuVisibility,
+        frontierBudgetState,
+        meshSelections,
+        frontierCandidates,
+      });
+    } else {
+      rootCandidates.sort((left, right) => right.score - left.score);
 
-      const shouldExpand = cluster.childIds.length > 0
-        && projectedSizePx > budgets.minProjectedNodeSizePx * (previouslySelected ? 1.12 : 1);
-
-      if (shouldExpand) {
-        candidates.push(
-          ...cluster.childIds
-            .map((childId) =>
-              this.scoreCandidate(descriptor, childId, camera, viewportHeight, pageTable, budgets),
-            )
-            .filter((childCandidate): childCandidate is ClusterCandidate => childCandidate !== null),
+      for (const rootCandidate of rootCandidates) {
+        const meshSelection = meshSelections.get(rootCandidate.descriptor.mesh.uuid)!;
+        const candidateSet = frontierCandidates.get(rootCandidate.descriptor.mesh.uuid)!;
+        this.tryAddFrontierCandidate(
+          rootCandidate,
+          budgets,
+          frontierBudgetState,
+          meshSelection,
+          candidateSet,
+          meshSelection.frontierClusterIds.length === 0,
         );
-        continue;
       }
 
-      const page = asset.pages[cluster.pageId]!;
-      const projectedOverdraw = cluster.expectedOverdrawScore * Math.max(0.35, screenRadius / 72);
-      const wouldOverflowPages = reservedPageSlots + 1 > budgets.maxActivePages;
-      const wouldOverflowSplats = reservedVisibleSplats + page.splatCount > budgets.maxVisibleSplats;
-      const wouldOverflowOverdraw = reservedOverdraw + projectedOverdraw > budgets.maxOverdrawBudget;
+      this.refineFrontier({
+        objects,
+        camera,
+        viewportHeight,
+        budgets,
+        gpuVisibility: effectiveGpuVisibility,
+        frontierBudgetState,
+        meshSelections,
+        frontierCandidates,
+      });
+    }
 
-      if (wouldOverflowPages || wouldOverflowSplats || wouldOverflowOverdraw) {
-        continue;
-      }
+    meshSelections.forEach((selection) => {
+      selection.frontierClusterIds.sort((left, right) => left - right);
+    });
 
-      meshSelection.frontierClusterIds.push(clusterId);
-      reservedPageSlots += 1;
-      reservedVisibleSplats += page.splatCount;
-      reservedOverdraw += projectedOverdraw;
-
-      if (pageTable.isResident(page.id)) {
-        pageTable.markTouched(page.id, frameIndex);
-        meshSelection.activeClusters.push({
-          clusterId,
-          pageId: page.id,
-          level: cluster.level,
-        });
-        meshSelection.activePageIds.push(page.id);
-        meshSelection.visibleSplats += page.splatCount;
-      } else {
-        pageTable.request(page.id, frameIndex);
-        meshSelection.requestedPageIds.push(page.id);
-      }
-
-      meshSelection.estimatedOverdraw += projectedOverdraw;
+    for (const descriptor of objects) {
+      this.populateSelectionResidency(descriptor, meshSelections.get(descriptor.mesh.uuid)!, frameIndex);
     }
 
     this.allocateResidentCapacities(objects, budgets.maxResidentPages);
@@ -191,6 +227,10 @@ export class BootstrapVisibilityScheduler {
       }
     }
 
+    for (const descriptor of objects) {
+      this.populateSelectionResidency(descriptor, meshSelections.get(descriptor.mesh.uuid)!, frameIndex);
+    }
+
     let visibleSplats = 0;
     let frontierClusters = 0;
     let activePages = 0;
@@ -220,6 +260,7 @@ export class BootstrapVisibilityScheduler {
 
     return {
       meshSelections,
+      schedulerMode,
       frontierClusters,
       visibleSplats,
       activePages,
@@ -229,6 +270,656 @@ export class BootstrapVisibilityScheduler {
       pageUploads,
       frontierStability: objects.length === 0 ? 1 : frontierStability / objects.length,
     };
+  }
+
+  private populateSelectionResidency(
+    descriptor: SplatSceneObjectDescriptor,
+    selection: SplatMeshSelection,
+    frameIndex: number,
+  ): void {
+    const mesh = descriptor.mesh;
+    const asset = mesh.getAsset();
+    const pageTable = mesh.getPageTable();
+    const activePageIds = new Set<number>();
+    const requestedPageIds = new Set<number>();
+
+    selection.activeClusters = [];
+    selection.activePageIds = [];
+    selection.requestedPageIds = [];
+    selection.visibleSplats = 0;
+
+    for (const clusterId of selection.frontierClusterIds) {
+      const cluster = asset.clusters[clusterId]!;
+      const page = asset.pages[cluster.pageId]!;
+
+      if (pageTable.isResident(page.id)) {
+        this.activateResidentCluster(selection, activePageIds, pageTable, page.id, clusterId, cluster.level, page.splatCount, frameIndex);
+        continue;
+      }
+
+      pageTable.request(page.id, frameIndex);
+      requestedPageIds.add(page.id);
+
+      const fallbackClusterId = this.findResidentFallbackClusterId(clusterId, asset, pageTable);
+
+      if (fallbackClusterId === null) {
+        continue;
+      }
+
+      const fallbackCluster = asset.clusters[fallbackClusterId]!;
+      const fallbackPage = asset.pages[fallbackCluster.pageId]!;
+      this.activateResidentCluster(
+        selection,
+        activePageIds,
+        pageTable,
+        fallbackPage.id,
+        fallbackClusterId,
+        fallbackCluster.level,
+        fallbackPage.splatCount,
+        frameIndex,
+      );
+    }
+
+    selection.requestedPageIds = [...requestedPageIds];
+  }
+
+  private activateResidentCluster(
+    selection: SplatMeshSelection,
+    activePageIds: Set<number>,
+    pageTable: ReturnType<SplatSceneObjectDescriptor['mesh']['getPageTable']>,
+    pageId: number,
+    clusterId: number,
+    level: number,
+    splatCount: number,
+    frameIndex: number,
+  ): void {
+    if (activePageIds.has(pageId)) {
+      return;
+    }
+
+    pageTable.markTouched(pageId, frameIndex);
+    activePageIds.add(pageId);
+    selection.activeClusters.push({
+      clusterId,
+      pageId,
+      level,
+    });
+    selection.activePageIds.push(pageId);
+    selection.visibleSplats += splatCount;
+  }
+
+  private findResidentFallbackClusterId(
+    clusterId: number,
+    asset: ReturnType<SplatSceneObjectDescriptor['mesh']['getAsset']>,
+    pageTable: ReturnType<SplatSceneObjectDescriptor['mesh']['getPageTable']>,
+  ): number | null {
+    let currentCluster = asset.clusters[clusterId]!;
+
+    while (currentCluster.parentId !== null) {
+      const parentCluster = asset.clusters[currentCluster.parentId]!;
+
+      if (pageTable.isResident(parentCluster.pageId)) {
+        return parentCluster.id;
+      }
+
+      currentCluster = parentCluster;
+    }
+
+    return pageTable.isResident(currentCluster.pageId) ? currentCluster.id : null;
+  }
+
+  private buildGpuFrontier(options: {
+    objects: readonly SplatSceneObjectDescriptor[];
+    camera: Camera,
+    viewportHeight: number,
+    budgets: SplatBudgetOptions,
+    gpuVisibility: SplatGpuVisibilityReadback,
+    frontierBudgetState: FrontierBudgetState,
+    meshSelections: Map<string, SplatMeshSelection>,
+    frontierCandidates: Map<string, Map<number, ClusterCandidate>>,
+  }): void {
+    const {
+      objects,
+      camera,
+      viewportHeight,
+      budgets,
+      gpuVisibility,
+      frontierBudgetState,
+      meshSelections,
+      frontierCandidates,
+    } = options;
+
+    for (const descriptor of objects) {
+      const mesh = descriptor.mesh;
+      const asset = mesh.getAsset();
+      const pageTable = mesh.getPageTable();
+      const meshSelection = meshSelections.get(mesh.uuid)!;
+      const meshFrontierCandidates = frontierCandidates.get(mesh.uuid)!;
+      const selectedClusterIds = new Set<number>();
+      const visibleClusterIds = gpuVisibility.getSortedVisibleClusterIds(mesh.uuid);
+      const visibleClusterSet = new Set(visibleClusterIds);
+
+      // Precompute visible-descendant counts once so the sort comparator is O(1)
+      // instead of O(subtree) per comparison (which was O(n·log n·depth) total).
+      const visibleDescendantCountCache = new Map<number, number>();
+      const getVisibleDescendantCount = (clusterId: number): number => {
+        const cached = visibleDescendantCountCache.get(clusterId);
+        if (cached !== undefined) return cached;
+        const result = this.countVisibleDescendants(clusterId, visibleClusterSet, asset);
+        visibleDescendantCountCache.set(clusterId, result);
+        return result;
+      };
+
+      const visibleCandidates = visibleClusterIds
+        .map((clusterId) =>
+          this.scoreCandidate(
+            descriptor,
+            clusterId,
+            camera,
+            viewportHeight,
+            pageTable,
+            budgets,
+            gpuVisibility,
+          ),
+        )
+        .filter((candidate): candidate is ClusterCandidate => candidate !== null)
+        .sort((left, right) => {
+          const leftCluster = asset.clusters[left.clusterId]!;
+          const rightCluster = asset.clusters[right.clusterId]!;
+          const leftPriority = left.score
+            * (1 + leftCluster.level * 0.6)
+            / Math.max(1, left.visibleCost * (1 + getVisibleDescendantCount(left.clusterId) * 0.35));
+          const rightPriority = right.score
+            * (1 + rightCluster.level * 0.6)
+            / Math.max(1, right.visibleCost * (1 + getVisibleDescendantCount(right.clusterId) * 0.35));
+
+          return rightPriority - leftPriority;
+        });
+
+      for (const candidate of visibleCandidates) {
+        const clusterId = candidate.clusterId;
+
+        if (selectedClusterIds.has(clusterId)) {
+          continue;
+        }
+
+        // Do NOT hard-skip ancestors with visible descendants.  When leaf pages
+        // are not yet resident the fallback needs the ancestor to be in the
+        // frontier; the hasSelectedAncestor/Descendant checks handle mutual
+        // exclusion once clusters are actually selected.
+        if (
+          this.hasSelectedAncestor(clusterId, selectedClusterIds, asset)
+          || this.hasSelectedDescendant(clusterId, selectedClusterIds, asset)
+        ) {
+          continue;
+        }
+
+        if (
+          this.tryAddFrontierCandidate(
+            candidate,
+            budgets,
+            frontierBudgetState,
+            meshSelection,
+            meshFrontierCandidates,
+            meshSelection.frontierClusterIds.length < 6,
+          )
+        ) {
+          selectedClusterIds.add(clusterId);
+        }
+      }
+
+      for (const rootClusterId of asset.rootClusterIds) {
+        if (this.subtreeHasSelectedCluster(rootClusterId, selectedClusterIds, asset)) {
+          continue;
+        }
+
+        const rootCandidate = this.scoreCandidate(
+          descriptor,
+          rootClusterId,
+          camera,
+          viewportHeight,
+          pageTable,
+          budgets,
+          gpuVisibility,
+        );
+
+        if (!rootCandidate) {
+          continue;
+        }
+
+        if (
+          this.tryAddFrontierCandidate(
+            rootCandidate,
+            budgets,
+            frontierBudgetState,
+            meshSelection,
+            meshFrontierCandidates,
+            meshSelection.frontierClusterIds.length === 0,
+          )
+        ) {
+          selectedClusterIds.add(rootClusterId);
+        }
+      }
+    }
+  }
+
+  private collectSeedCandidates(
+    descriptor: SplatSceneObjectDescriptor,
+    camera: Camera,
+    viewportHeight: number,
+    pageTable: ReturnType<SplatSceneObjectDescriptor['mesh']['getPageTable']>,
+    budgets: SplatBudgetOptions,
+    gpuVisibility?: SplatGpuVisibilityReadback,
+  ): ClusterCandidate[] {
+    const asset = descriptor.mesh.getAsset();
+    const previousFrontier = descriptor.mesh.getPreviousFrontierClusterIds();
+
+    if (previousFrontier.length === 0 || this.cameraMotionFactor > 0.22) {
+      return asset.rootClusterIds
+        .map((clusterId) =>
+          this.scoreCandidate(descriptor, clusterId, camera, viewportHeight, pageTable, budgets, gpuVisibility),
+        )
+        .filter((candidate): candidate is ClusterCandidate => candidate !== null);
+    }
+
+    const seededRoots = new Set<number>();
+    const seeds = previousFrontier
+      .map((clusterId) =>
+        this.scoreCandidate(descriptor, clusterId, camera, viewportHeight, pageTable, budgets, gpuVisibility),
+      )
+      .filter((candidate): candidate is ClusterCandidate => {
+        if (candidate === null) {
+          return false;
+        }
+
+        seededRoots.add(this.getRootClusterId(candidate.clusterId, asset));
+        return true;
+      });
+
+    for (const rootClusterId of asset.rootClusterIds) {
+      if (seededRoots.has(rootClusterId)) {
+        continue;
+      }
+
+      const rootCandidate = this.scoreCandidate(
+        descriptor,
+        rootClusterId,
+        camera,
+        viewportHeight,
+        pageTable,
+        budgets,
+        gpuVisibility,
+      );
+
+      if (rootCandidate) {
+        seeds.push(rootCandidate);
+      }
+    }
+
+    return seeds;
+  }
+
+  private refineFrontier(options: {
+    objects: readonly SplatSceneObjectDescriptor[];
+    camera: Camera,
+    viewportHeight: number,
+    budgets: SplatBudgetOptions,
+    gpuVisibility: SplatGpuVisibilityReadback | undefined,
+    frontierBudgetState: FrontierBudgetState,
+    meshSelections: Map<string, SplatMeshSelection>,
+    frontierCandidates: Map<string, Map<number, ClusterCandidate>>;
+  }): void {
+    const {
+      objects,
+      camera,
+      viewportHeight,
+      budgets,
+      gpuVisibility,
+      frontierBudgetState,
+      meshSelections,
+      frontierCandidates,
+    } = options;
+
+    let madeProgress = true;
+
+    while (madeProgress) {
+      madeProgress = false;
+      const refinementOptions: FrontierRefinementOption[] = [];
+
+      for (const descriptor of objects) {
+        const mesh = descriptor.mesh;
+        const asset = mesh.getAsset();
+        const pageTable = mesh.getPageTable();
+        const meshFrontierCandidates = frontierCandidates.get(mesh.uuid)!;
+        const previousFrontierSet = new Set(mesh.getPreviousFrontierClusterIds());
+        const pinnedDescendantMemo = new Map<number, boolean>();
+
+        for (const parent of meshFrontierCandidates.values()) {
+          const cluster = asset.clusters[parent.clusterId]!;
+
+          if (!this.shouldRefineCandidate(
+            parent,
+            clusterId => this.hasPinnedDescendant(
+              clusterId,
+              asset,
+              previousFrontierSet,
+              pageTable,
+              pinnedDescendantMemo,
+            ),
+            budgets,
+          )) {
+            continue;
+          }
+
+          const children = cluster.childIds
+            .map((childId) =>
+              this.scoreCandidate(descriptor, childId, camera, viewportHeight, pageTable, budgets, gpuVisibility),
+            )
+            .filter((childCandidate): childCandidate is ClusterCandidate => childCandidate !== null)
+            .sort((left, right) => right.score - left.score);
+
+          if (children.length === 0) {
+            continue;
+          }
+
+          const childVisibleSplats = children.reduce(
+            (sum, child) => sum + asset.pages[asset.clusters[child.clusterId]!.pageId]!.splatCount,
+            0,
+          );
+          const childOverdraw = children.reduce((sum, child) => sum + this.getCandidateOverdraw(child), 0);
+          const parentPage = asset.pages[cluster.pageId]!;
+
+          refinementOptions.push({
+            descriptor,
+            parent,
+            children,
+            deltaPageSlots: children.length - 1,
+            deltaVisibleSplats: children.reduce((sum, child) => sum + child.visibleCost, 0) - parent.visibleCost,
+            deltaOverdraw: childOverdraw - this.getCandidateOverdraw(parent),
+            priority: children.reduce((sum, child) => sum + child.score, 0) - parent.score + parent.projectedSizePx * 0.05,
+          });
+        }
+      }
+
+      refinementOptions.sort((left, right) => right.priority - left.priority);
+
+      for (const option of refinementOptions) {
+        const mesh = option.descriptor.mesh;
+        const meshSelection = meshSelections.get(mesh.uuid)!;
+        const meshFrontierCandidates = frontierCandidates.get(mesh.uuid)!;
+
+        if (!meshFrontierCandidates.has(option.parent.clusterId)) {
+          continue;
+        }
+
+        if (!this.canReplaceFrontierCandidate(option, frontierBudgetState, budgets)) {
+          continue;
+        }
+
+        this.replaceFrontierCandidate(
+          option.parent,
+          option.children,
+          frontierBudgetState,
+          meshSelection,
+          meshFrontierCandidates,
+        );
+        madeProgress = true;
+      }
+    }
+  }
+
+  private shouldRefineCandidate(
+    candidate: ClusterCandidate,
+    hasPinnedDescendantSelection: (clusterId: number) => boolean,
+    budgets: SplatBudgetOptions,
+  ): boolean {
+    if (candidate.projectedSizePx <= 0) {
+      return false;
+    }
+
+    const motionDamping = 1 - Math.min(1, this.cameraMotionFactor * 1.6);
+    const refinementHysteresis = hasPinnedDescendantSelection(candidate.clusterId)
+      ? 0.68 + (1 - motionDamping) * 0.24
+      : 0.9 + (1 - motionDamping) * 0.08;
+    return candidate.projectedSizePx > budgets.minProjectedNodeSizePx * refinementHysteresis;
+  }
+
+  private hasPinnedDescendant(
+    clusterId: number,
+    asset: ReturnType<SplatSceneObjectDescriptor['mesh']['getAsset']>,
+    previousFrontierSet: ReadonlySet<number>,
+    pageTable: ReturnType<SplatSceneObjectDescriptor['mesh']['getPageTable']>,
+    memo: Map<number, boolean>,
+  ): boolean {
+    const cached = memo.get(clusterId);
+
+    if (cached !== undefined) {
+      return cached;
+    }
+
+    const cluster = asset.clusters[clusterId]!;
+    let result = false;
+
+    for (const childId of cluster.childIds) {
+      const childCluster = asset.clusters[childId]!;
+
+      if ((previousFrontierSet.has(childId) || pageTable.isResident(childCluster.pageId)) && this.cameraMotionFactor < 0.3) {
+        result = true;
+        break;
+      }
+
+      if (this.hasPinnedDescendant(childId, asset, previousFrontierSet, pageTable, memo)) {
+        result = true;
+        break;
+      }
+    }
+
+    memo.set(clusterId, result);
+    return result;
+  }
+
+  private tryAddFrontierCandidate(
+    candidate: ClusterCandidate,
+    budgets: SplatBudgetOptions,
+    frontierBudgetState: FrontierBudgetState,
+    meshSelection: SplatMeshSelection,
+    frontierCandidates: Map<number, ClusterCandidate>,
+    allowOverflowForCoverage = false,
+  ): boolean {
+    const cluster = candidate.descriptor.mesh.getAsset().clusters[candidate.clusterId]!;
+    const projectedOverdraw = this.getCandidateOverdraw(candidate);
+    const wouldOverflowPages = frontierBudgetState.reservedPageSlots + 1 > budgets.maxActivePages;
+    const wouldOverflowSplats = frontierBudgetState.reservedVisibleSplats + candidate.visibleCost > budgets.maxVisibleSplats;
+    const wouldOverflowOverdraw = frontierBudgetState.reservedOverdraw + projectedOverdraw > budgets.maxOverdrawBudget;
+
+    if (!allowOverflowForCoverage && (wouldOverflowPages || wouldOverflowSplats || wouldOverflowOverdraw)) {
+      return false;
+    }
+
+    if (!frontierCandidates.has(candidate.clusterId)) {
+      meshSelection.frontierClusterIds.push(candidate.clusterId);
+      meshSelection.estimatedOverdraw += projectedOverdraw;
+      frontierBudgetState.reservedPageSlots += 1;
+      frontierBudgetState.reservedVisibleSplats += candidate.visibleCost;
+      frontierBudgetState.reservedOverdraw += projectedOverdraw;
+      frontierCandidates.set(candidate.clusterId, candidate);
+    }
+
+    return true;
+  }
+
+  private canReplaceFrontierCandidate(
+    option: FrontierRefinementOption,
+    frontierBudgetState: FrontierBudgetState,
+    budgets: SplatBudgetOptions,
+  ): boolean {
+    return frontierBudgetState.reservedPageSlots + option.deltaPageSlots <= budgets.maxActivePages
+      && frontierBudgetState.reservedVisibleSplats + option.deltaVisibleSplats <= budgets.maxVisibleSplats
+      && frontierBudgetState.reservedOverdraw + option.deltaOverdraw <= budgets.maxOverdrawBudget;
+  }
+
+  private replaceFrontierCandidate(
+    parent: ClusterCandidate,
+    children: readonly ClusterCandidate[],
+    frontierBudgetState: FrontierBudgetState,
+    meshSelection: SplatMeshSelection,
+    frontierCandidates: Map<number, ClusterCandidate>,
+  ): void {
+    this.removeFrontierCandidate(parent, frontierBudgetState, meshSelection, frontierCandidates);
+
+    for (const child of children) {
+      this.addFrontierCandidateUnchecked(child, frontierBudgetState, meshSelection, frontierCandidates);
+    }
+  }
+
+  private removeFrontierCandidate(
+    candidate: ClusterCandidate,
+    frontierBudgetState: FrontierBudgetState,
+    meshSelection: SplatMeshSelection,
+    frontierCandidates: Map<number, ClusterCandidate>,
+  ): void {
+    const overdraw = this.getCandidateOverdraw(candidate);
+    const clusterIndex = meshSelection.frontierClusterIds.indexOf(candidate.clusterId);
+
+    if (clusterIndex !== -1) {
+      meshSelection.frontierClusterIds.splice(clusterIndex, 1);
+    }
+
+    meshSelection.estimatedOverdraw = Math.max(0, meshSelection.estimatedOverdraw - overdraw);
+    frontierBudgetState.reservedPageSlots = Math.max(0, frontierBudgetState.reservedPageSlots - 1);
+    frontierBudgetState.reservedVisibleSplats = Math.max(0, frontierBudgetState.reservedVisibleSplats - candidate.visibleCost);
+    frontierBudgetState.reservedOverdraw = Math.max(0, frontierBudgetState.reservedOverdraw - overdraw);
+    frontierCandidates.delete(candidate.clusterId);
+  }
+
+  private addFrontierCandidateUnchecked(
+    candidate: ClusterCandidate,
+    frontierBudgetState: FrontierBudgetState,
+    meshSelection: SplatMeshSelection,
+    frontierCandidates: Map<number, ClusterCandidate>,
+  ): void {
+    const overdraw = this.getCandidateOverdraw(candidate);
+
+    if (frontierCandidates.has(candidate.clusterId)) {
+      return;
+    }
+
+    meshSelection.frontierClusterIds.push(candidate.clusterId);
+    meshSelection.estimatedOverdraw += overdraw;
+    frontierBudgetState.reservedPageSlots += 1;
+    frontierBudgetState.reservedVisibleSplats += candidate.visibleCost;
+    frontierBudgetState.reservedOverdraw += overdraw;
+    frontierCandidates.set(candidate.clusterId, candidate);
+  }
+
+  private getRootClusterId(
+    clusterId: number,
+    asset: ReturnType<SplatSceneObjectDescriptor['mesh']['getAsset']>,
+  ): number {
+    let currentCluster = asset.clusters[clusterId]!;
+
+    while (currentCluster.parentId !== null) {
+      currentCluster = asset.clusters[currentCluster.parentId]!;
+    }
+
+    return currentCluster.id;
+  }
+
+  private hasSelectedAncestor(
+    clusterId: number,
+    selectedClusterIds: ReadonlySet<number>,
+    asset: ReturnType<SplatSceneObjectDescriptor['mesh']['getAsset']>,
+  ): boolean {
+    let currentCluster = asset.clusters[clusterId]!;
+
+    while (currentCluster.parentId !== null) {
+      if (selectedClusterIds.has(currentCluster.parentId)) {
+        return true;
+      }
+
+      currentCluster = asset.clusters[currentCluster.parentId]!;
+    }
+
+    return false;
+  }
+
+  private hasSelectedDescendant(
+    clusterId: number,
+    selectedClusterIds: ReadonlySet<number>,
+    asset: ReturnType<SplatSceneObjectDescriptor['mesh']['getAsset']>,
+  ): boolean {
+    const cluster = asset.clusters[clusterId]!;
+
+    for (const childId of cluster.childIds) {
+      if (selectedClusterIds.has(childId) || this.hasSelectedDescendant(childId, selectedClusterIds, asset)) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  private subtreeHasSelectedCluster(
+    clusterId: number,
+    selectedClusterIds: ReadonlySet<number>,
+    asset: ReturnType<SplatSceneObjectDescriptor['mesh']['getAsset']>,
+  ): boolean {
+    if (selectedClusterIds.has(clusterId)) {
+      return true;
+    }
+
+    const cluster = asset.clusters[clusterId]!;
+    return cluster.childIds.some((childId) => this.subtreeHasSelectedCluster(childId, selectedClusterIds, asset));
+  }
+
+  private countVisibleDescendants(
+    clusterId: number,
+    visibleClusterIds: ReadonlySet<number>,
+    asset: ReturnType<SplatSceneObjectDescriptor['mesh']['getAsset']>,
+  ): number {
+    let count = 0;
+    const cluster = asset.clusters[clusterId]!;
+
+    for (const childId of cluster.childIds) {
+      if (visibleClusterIds.has(childId)) {
+        count += 1;
+      }
+
+      count += this.countVisibleDescendants(childId, visibleClusterIds, asset);
+    }
+
+    return count;
+  }
+
+  private measureCameraMotion(camera: Camera): number {
+    camera.getWorldPosition(this.currentCameraPosition);
+    camera.getWorldDirection(this.currentCameraForward);
+
+    if (!this.hasPreviousCameraState) {
+      this.previousCameraPosition.copy(this.currentCameraPosition);
+      this.previousCameraForward.copy(this.currentCameraForward);
+      this.hasPreviousCameraState = true;
+      return 0;
+    }
+
+    const positionDelta = this.currentCameraPosition.distanceTo(this.previousCameraPosition);
+    const angularDelta = 1 - Math.max(-1, Math.min(1, this.currentCameraForward.dot(this.previousCameraForward)));
+    const normalizedPositionDelta = positionDelta / Math.max(1, this.currentCameraPosition.length());
+    const motionFactor = Math.min(1, normalizedPositionDelta * 8 + angularDelta * 4);
+
+    this.previousCameraPosition.copy(this.currentCameraPosition);
+    this.previousCameraForward.copy(this.currentCameraForward);
+
+    return motionFactor;
+  }
+
+  private getCandidateOverdraw(candidate: ClusterCandidate): number {
+    const cluster = candidate.descriptor.mesh.getAsset().clusters[candidate.clusterId]!;
+    // Cap the screen-fill multiplier: when inside/close to a model the screen radius
+    // becomes thousands of pixels, making overdraw astronomically large and blocking
+    // all but the first frontier cluster.  Clamp to an 8-tile equivalent maximum.
+    const screenFill = Math.min(3.0, Math.max(0.35, candidate.screenRadius / 72));
+    return cluster.expectedOverdrawScore * screenFill;
   }
 
   private allocateResidentCapacities(
@@ -273,43 +964,69 @@ export class BootstrapVisibilityScheduler {
     viewportHeight: number,
     pageTable: ReturnType<SplatSceneObjectDescriptor['mesh']['getPageTable']>,
     budgets: SplatBudgetOptions,
+    gpuVisibility?: SplatGpuVisibilityReadback,
   ): ClusterCandidate | null {
     const mesh = descriptor.mesh;
     const asset = mesh.getAsset();
     const cluster = asset.clusters[clusterId]!;
-    const matrixWorld = mesh.matrixWorld.elements;
-    const maxScale = Math.max(
-      Math.hypot(matrixWorld[0]!, matrixWorld[1]!, matrixWorld[2]!),
-      Math.hypot(matrixWorld[4]!, matrixWorld[5]!, matrixWorld[6]!),
-      Math.hypot(matrixWorld[8]!, matrixWorld[9]!, matrixWorld[10]!),
-    );
+    const gpuResult = gpuVisibility?.get(mesh.uuid, clusterId) ?? null;
+    let projectedSizePx = 0;
+    let screenRadius = 0;
 
-    this.worldCenter
-      .set(cluster.center[0], cluster.center[1], cluster.center[2])
-      .applyMatrix4(mesh.matrixWorld);
+    if (gpuResult) {
+      if (!gpuResult.visible || gpuResult.projectedSizePx <= 0.75) {
+        return null;
+      }
 
-    this.sphere.center.copy(this.worldCenter);
-    this.sphere.radius = cluster.radius * maxScale;
+      this.worldCenter
+        .set(cluster.center[0], cluster.center[1], cluster.center[2])
+        .applyMatrix4(mesh.matrixWorld);
+      projectedSizePx = gpuResult.projectedSizePx;
+      screenRadius = gpuResult.screenRadius;
+    } else {
+      const matrixWorld = mesh.matrixWorld.elements;
+      const maxScale = Math.max(
+        Math.hypot(matrixWorld[0]!, matrixWorld[1]!, matrixWorld[2]!),
+        Math.hypot(matrixWorld[4]!, matrixWorld[5]!, matrixWorld[6]!),
+        Math.hypot(matrixWorld[8]!, matrixWorld[9]!, matrixWorld[10]!),
+      );
 
-    if (!this.frustum.intersectsSphere(this.sphere)) {
-      return null;
-    }
+      this.worldCenter
+        .set(cluster.center[0], cluster.center[1], cluster.center[2])
+        .applyMatrix4(mesh.matrixWorld);
 
-    const projectedSizePx = this.getProjectedRadiusPx(camera, this.worldCenter, this.sphere.radius, viewportHeight);
-    if (projectedSizePx <= 0.75) {
-      return null;
+      this.sphere.center.copy(this.worldCenter);
+      this.sphere.radius = cluster.radius * maxScale;
+
+      if (!this.frustum.intersectsSphere(this.sphere)) {
+        return null;
+      }
+
+      projectedSizePx = this.getProjectedRadiusPx(camera, this.worldCenter, this.sphere.radius, viewportHeight);
+      if (projectedSizePx <= 0.75) {
+        return null;
+      }
+
+      screenRadius = projectedSizePx;
     }
 
     this.projectedCenter.copy(this.worldCenter).project(camera);
     const radialDistance = Math.min(1.5, Math.hypot(this.projectedCenter.x, this.projectedCenter.y));
     const foveationWeight = Math.max(0.25, 1 - radialDistance * 0.25 * budgets.peripheralFoveation);
     const temporalWeight = mesh.getPreviousFrontierClusterIds().includes(clusterId)
-      ? budgets.temporalStabilityBias
+      ? 1 + (budgets.temporalStabilityBias - 1) * Math.max(0, 1 - this.cameraMotionFactor * 1.8)
       : 1;
     const semanticWeight = hasSemanticFlag(cluster.semanticMask, 'hero') ? 1.35 : 1;
     const residencyWeight = pageTable.getState(cluster.pageId).state === SplatPageResidencyState.Resident
       ? 1.1
       : 0.92;
+    const closeUpPressure = Math.max(1, projectedSizePx / Math.max(1, budgets.minProjectedNodeSizePx));
+    const detailCredit = Math.min(5, Math.pow(closeUpPressure, 0.85));
+    const refinementCredit = cluster.childIds.length > 0 ? 1.15 : 1;
+    const visibleCost = Math.max(
+      192,
+      Math.round(asset.pages[cluster.pageId]!.splatCount / (detailCredit * residencyWeight * refinementCredit)),
+    );
     const densityPenalty = 1 + cluster.expectedOverdrawScore / Math.max(1, budgets.maxOverdrawBudget);
     const score = (
       projectedSizePx
@@ -319,6 +1036,7 @@ export class BootstrapVisibilityScheduler {
       * temporalWeight
       * semanticWeight
       * residencyWeight
+      * Math.min(1.8, 0.9 + closeUpPressure * 0.22)
     ) / densityPenalty;
 
     return {
@@ -326,7 +1044,8 @@ export class BootstrapVisibilityScheduler {
       clusterId,
       score,
       projectedSizePx,
-      screenRadius: projectedSizePx,
+      screenRadius,
+      visibleCost,
     };
   }
 

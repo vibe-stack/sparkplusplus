@@ -1,5 +1,4 @@
 import { createSplatAsset, type SplatAsset, type SplatClusterNode, type SplatPage, type SplatVec3 } from './model';
-import { SPLAT_SEMANTIC_FLAGS } from '../core/semantics';
 import type { SplatSource } from '../scene/source';
 
 export interface SpzHeader {
@@ -89,7 +88,7 @@ function parseSpzBuffer(buffer: ArrayBuffer, options: SpzImportOptions): {
     throw new Error(`Unsupported SPZ version ${header.version}`);
   }
 
-  const pointCloud = samplePointCloud(view, header, options.maxPoints ?? 320_000);
+  const pointCloud = samplePointCloud(view, header, options.maxPoints ?? header.pointCount);
   const pageCapacity = Math.max(256, options.pageCapacity ?? 1_024);
   const branching = Math.max(2, Math.min(8, options.branching ?? 4));
   const minLeafPoints = Math.max(pageCapacity, options.minLeafPoints ?? pageCapacity);
@@ -235,6 +234,12 @@ function buildPagedAssetFromPointCloud(
     parentId: number | null,
   ): BuildNodeResult => {
     const count = end - start;
+    // Internal (non-leaf) nodes only need a small coverage proxy page — their
+    // job is to provide fallback splats while leaf pages stream in, not to
+    // consume the active-page visual budget with sparse 4096-point samples
+    // spread over a huge volume.  Leaf nodes get the full page capacity.
+    const isLeaf = count <= options.minLeafPoints;
+    const effectiveCapacity = isLeaf ? options.pageCapacity : Math.min(256, options.pageCapacity);
     const pageId = pages.length;
     const page = createPageFromRange(
       pageId,
@@ -242,7 +247,7 @@ function buildPagedAssetFromPointCloud(
       pointCloud,
       start,
       end,
-      options.pageCapacity,
+      effectiveCapacity,
       level,
     );
     pages.push(page);
@@ -262,7 +267,7 @@ function buildPagedAssetFromPointCloud(
       anisotropySeverity: 0.25,
       expectedOverdrawScore: 0,
       motionSensitivity: 0,
-      semanticMask: SPLAT_SEMANTIC_FLAGS.hero,
+      semanticMask: 0,
       parentId,
       childIds: [],
     });
@@ -401,7 +406,7 @@ function createPageFromRange(
     level,
     splatCount: sampleCount,
     capacity: pageCapacity,
-    semanticMask: SPLAT_SEMANTIC_FLAGS.hero,
+    semanticMask: 0,
     byteSize: positions.byteLength + scales.byteLength + colors.byteLength + opacities.byteLength,
     positions,
     scales,

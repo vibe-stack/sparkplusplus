@@ -2,10 +2,9 @@ import './style.css';
 import {
   SPARK_ENGINE_DESCRIPTOR,
   SPARK_FRAME_GRAPH,
-  SPLAT_SEMANTIC_FLAGS,
-  SplatEffectStack,
   SplatMaterial,
   SplatMesh,
+  SplatQualityGovernor,
   SplatRendererBridge,
   SpzSplatSource,
   getSparkBanner,
@@ -26,9 +25,64 @@ import {
   SRGBColorSpace,
   Vector3,
 } from 'three';
+import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { WebGPURenderer } from 'three/webgpu';
 
 const app = document.querySelector<HTMLDivElement>('#app');
+
+interface PlaygroundComplexSplatPreset {
+  name: string;
+  importPointCap: number | null;
+  pageCapacity: number;
+  visibleBudget: number;
+  overdrawBudget: number;
+  activePages: number;
+  residentPages: number;
+  uploadsPerFrame: number;
+  coverageBiasPx: number;
+  peripheralFoveation: number;
+  heroTiles: number;
+  temporalStabilityBias: number;
+  pointSize: number;
+  opacity: number;
+  useGpuVisibilityReadback: boolean;
+  orbitRadiusScale: number;
+  orbitHeightScale: number;
+  orbitDepthScale: number;
+  lookHeightScale: number;
+}
+
+const COMPLEX_SPLAT_PRESET: PlaygroundComplexSplatPreset = {
+  name: 'Coverage',
+  importPointCap: null,
+  pageCapacity: 8_192,
+  visibleBudget: 4_000_000,
+  overdrawBudget: 600_000,
+  activePages: 256,
+  residentPages: 512,
+  uploadsPerFrame: 64,
+  coverageBiasPx: 36,
+  peripheralFoveation: 0,
+  heroTiles: 20,
+  temporalStabilityBias: 1.08,
+  pointSize: 6,
+  opacity: 0.99,
+  useGpuVisibilityReadback: true,
+  orbitRadiusScale: 0.66,
+  orbitHeightScale: 0.18,
+  orbitDepthScale: 0.58,
+  lookHeightScale: 0.28,
+};
+
+class LockedQualityGovernor extends SplatQualityGovernor {
+  override observe(snapshot: SplatFrameStatsSnapshot) {
+    return {
+      level: this.getLevel(),
+      reason: 'locked',
+      budgets: this.getBudgets(),
+    };
+  }
+}
 
 if (!app) {
   throw new Error('Missing #app root');
@@ -41,9 +95,9 @@ app.innerHTML = `
         <p class="eyebrow">Spark++ milestone bootstrap</p>
         <h1>${getSparkBanner()}</h1>
         <p class="body">
-          <strong>M0</strong> foundation and <strong>M1</strong> asset/page residency are live.
-          This demo now imports the real <strong>demo.spz</strong> asset from the public folder and
-          builds a paged hierarchy from the source data before the future GPU compositor stages arrive.
+          The demo imports the real <strong>demo.spz</strong> asset, runs GPU cluster visibility/scoring,
+          and draws the active frontier through the baseline sprite compositor while ordinary three.js meshes
+          still share the same scene.
         </p>
       </section>
 
@@ -56,6 +110,14 @@ app.innerHTML = `
           <div>
             <dt>CPU frame</dt>
             <dd id="metric-frame">0.0 ms</dd>
+          </div>
+          <div>
+            <dt>GPU visibility</dt>
+            <dd id="metric-gpu">warming up</dd>
+          </div>
+          <div>
+            <dt>Scheduler</dt>
+            <dd id="metric-scheduler">CPU</dd>
           </div>
           <div>
             <dt>Visible splats</dt>
@@ -80,6 +142,14 @@ app.innerHTML = `
           <div>
             <dt>Frontier stability</dt>
             <dd id="metric-stability">0%</dd>
+          </div>
+          <div>
+            <dt>Tile mix</dt>
+            <dd id="metric-tiles">0 active</dd>
+          </div>
+          <div>
+            <dt>Queues</dt>
+            <dd id="metric-queues">W0 · H0</dd>
           </div>
           <div>
             <dt>Governor</dt>
@@ -124,12 +194,16 @@ app.innerHTML = `
 
 const viewport = app.querySelector<HTMLDivElement>('#viewport');
 const metricFrame = app.querySelector<HTMLElement>('#metric-frame');
+const metricGpu = app.querySelector<HTMLElement>('#metric-gpu');
+const metricScheduler = app.querySelector<HTMLElement>('#metric-scheduler');
 const metricSplats = app.querySelector<HTMLElement>('#metric-splats');
 const metricPages = app.querySelector<HTMLElement>('#metric-pages');
 const metricResident = app.querySelector<HTMLElement>('#metric-resident');
 const metricUploads = app.querySelector<HTMLElement>('#metric-uploads');
 const metricFaults = app.querySelector<HTMLElement>('#metric-faults');
 const metricStability = app.querySelector<HTMLElement>('#metric-stability');
+const metricTiles = app.querySelector<HTMLElement>('#metric-tiles');
+const metricQueues = app.querySelector<HTMLElement>('#metric-queues');
 const metricGovernor = app.querySelector<HTMLElement>('#metric-governor');
 const budgetObjectCount = app.querySelector<HTMLElement>('#budget-object-count');
 const budgetStrip = app.querySelector<HTMLElement>('#budget-strip');
@@ -138,12 +212,16 @@ const meshList = app.querySelector<HTMLDivElement>('#mesh-list');
 if (
   !viewport
   || !metricFrame
+  || !metricGpu
+  || !metricScheduler
   || !metricSplats
   || !metricPages
   || !metricResident
   || !metricUploads
   || !metricFaults
   || !metricStability
+  || !metricTiles
+  || !metricQueues
   || !metricGovernor
   || !budgetObjectCount
   || !budgetStrip
@@ -155,12 +233,16 @@ if (
 const ui = {
   viewport,
   metricFrame,
+  metricGpu,
+  metricScheduler,
   metricSplats,
   metricPages,
   metricResident,
   metricUploads,
   metricFaults,
   metricStability,
+  metricTiles,
+  metricQueues,
   metricGovernor,
   budgetObjectCount,
   budgetStrip,
@@ -171,19 +253,45 @@ function formatInteger(value: number): string {
   return new Intl.NumberFormat('en-US').format(Math.round(value));
 }
 
+function isEditableTarget(target: EventTarget | null): boolean {
+  return target instanceof HTMLElement && (
+    target.isContentEditable
+    || target instanceof HTMLInputElement
+    || target instanceof HTMLTextAreaElement
+    || target instanceof HTMLSelectElement
+  );
+}
+
 function updateHud(snapshot: SplatFrameStatsSnapshot): void {
   ui.metricFrame.textContent = `${snapshot.cpuFrameMs.toFixed(2)} ms`;
+  ui.metricGpu.textContent = snapshot.gpuVisibilityReady
+    ? `ready · ${snapshot.gpuClusterCount} clusters · ${snapshot.gpuVisibilityFrameLag}f lag`
+    : snapshot.gpuVisibilityPending
+      ? 'dispatching'
+      : 'cpu fallback';
+  ui.metricScheduler.textContent = snapshot.schedulerMode === 'gpu-readback' ? 'GPU readback' : 'CPU bootstrap';
   ui.metricSplats.textContent = formatInteger(snapshot.visibleSplats);
   ui.metricPages.textContent = `${snapshot.activePages} / ${snapshot.budgets.maxActivePages}`;
   ui.metricResident.textContent = `${snapshot.residentPages} / ${snapshot.budgets.maxResidentPages}`;
   ui.metricUploads.textContent = `${snapshot.pageUploads} / ${snapshot.budgets.maxPageUploadsPerFrame}`;
   ui.metricFaults.textContent = `${(snapshot.pageFaultRate * 100).toFixed(0)}%`;
   ui.metricStability.textContent = `${(snapshot.frontierStability * 100).toFixed(0)}%`;
+  ui.metricTiles.textContent = [
+    `${snapshot.compositorActiveTiles} active`,
+    `${snapshot.compositorHeroTiles} hero`,
+    `${snapshot.compositorDepthSlicedTiles} depth`,
+  ].join(' · ');
+  ui.metricQueues.textContent = [
+    `W${formatInteger(snapshot.compositorWeightedInstances)}`,
+    `H${formatInteger(snapshot.compositorHeroInstances)}`,
+    `D${formatInteger(snapshot.compositorDepthSlicedInstances)}`,
+  ].join(' · ');
   ui.metricGovernor.textContent = `L${snapshot.appliedGovernorLevel} · ${snapshot.governorReason}`;
   ui.budgetObjectCount.textContent = `${snapshot.meshCount} objects`;
   ui.budgetStrip.textContent = [
     `${formatInteger(snapshot.budgets.maxVisibleSplats)} splat budget`,
     `${snapshot.estimatedOverdraw.toFixed(0)} / ${snapshot.budgets.maxOverdrawBudget} overdraw`,
+    `${snapshot.compositorWeightedTiles}/${snapshot.compositorDepthSlicedTiles}/${snapshot.compositorHeroTiles} tile classes`,
     `${(snapshot.sceneDescriptorBytes / 1024).toFixed(1)} KB scene descriptors`,
     `${((snapshot.clusterMetadataBytes + snapshot.pageDescriptorBytes + snapshot.residencyBytes) / 1024).toFixed(1)} KB runtime buffers`,
   ].join(' · ');
@@ -199,6 +307,11 @@ function updateHud(snapshot: SplatFrameStatsSnapshot): void {
           frontier ${mesh.frontierClusters} · active ${mesh.activePages} · resident ${mesh.residentPages} ·
           requested ${mesh.requestedPages} · stability ${(mesh.frontierStability * 100).toFixed(0)}%
         </p>
+        <p>
+          queues W${formatInteger(mesh.weightedInstances)} · H${formatInteger(mesh.heroInstances)} ·
+          D${formatInteger(mesh.depthSlicedInstances)} · tiles ${mesh.activeTiles} active /
+          ${mesh.heroTiles} hero / ${mesh.depthSlicedTiles} depth
+        </p>
       </article>
     `)
     .join('');
@@ -212,21 +325,41 @@ async function bootstrap(): Promise<void> {
 
   const source = await SpzSplatSource.fromUrl('/demo.spz', {
     label: 'Demo SPZ',
-    maxPoints: 320_000,
-    pageCapacity: 1_024,
+    ...(COMPLEX_SPLAT_PRESET.importPointCap === null
+      ? {}
+      : { maxPoints: COMPLEX_SPLAT_PRESET.importPointCap }),
+    pageCapacity: COMPLEX_SPLAT_PRESET.pageCapacity,
     branching: 4,
   });
   const importedAsset = source.buildAsset();
+  const sampledPoints = COMPLEX_SPLAT_PRESET.importPointCap === null
+    ? source.header.pointCount
+    : Math.min(source.header.pointCount, COMPLEX_SPLAT_PRESET.importPointCap);
+  ui.budgetStrip.textContent = [
+    `${COMPLEX_SPLAT_PRESET.name} preset`,
+    `Loaded ${formatInteger(source.header.pointCount)} source splats`,
+    sampledPoints === source.header.pointCount
+      ? 'full-resolution import'
+      : `sampling ${formatInteger(sampledPoints)} into runtime pages`,
+    `${COMPLEX_SPLAT_PRESET.pageCapacity}-splat pages`,
+    `${COMPLEX_SPLAT_PRESET.coverageBiasPx}px coverage bias`,
+  ].join(' · ');
   const assetBounds = new Box3(
     new Vector3(...importedAsset.localBoundsMin),
     new Vector3(...importedAsset.localBoundsMax),
   );
   const assetCenter = assetBounds.getCenter(new Vector3());
   const assetSize = assetBounds.getSize(new Vector3());
-  const orbitRadius = Math.max(assetSize.x, assetSize.y, assetSize.z) * 0.9;
+  const orbitRadius = Math.max(assetSize.x, assetSize.y, assetSize.z) * COMPLEX_SPLAT_PRESET.orbitRadiusScale;
 
   const camera = new PerspectiveCamera(42, 1, 0.1, 320);
-  camera.position.set(orbitRadius, assetSize.y * 0.32, orbitRadius * 0.72);
+  camera.position.set(
+    orbitRadius,
+    assetSize.y * COMPLEX_SPLAT_PRESET.orbitHeightScale,
+    orbitRadius * COMPLEX_SPLAT_PRESET.orbitDepthScale,
+  );
+  const target = new Vector3(0, assetSize.y * COMPLEX_SPLAT_PRESET.lookHeightScale, 0);
+  camera.lookAt(target);
 
   const renderer = new WebGPURenderer({
     antialias: true,
@@ -237,6 +370,14 @@ async function bootstrap(): Promise<void> {
   renderer.domElement.classList.add('viewport-canvas');
   ui.viewport.append(renderer.domElement);
   await renderer.init();
+
+  const controls = new OrbitControls(camera, renderer.domElement);
+  controls.enableDamping = true;
+  controls.dampingFactor = 0.08;
+  controls.target.copy(target);
+  controls.minDistance = Math.max(assetSize.length() * 0.05, 0.5);
+  controls.maxDistance = Math.max(assetSize.length() * 4, 12);
+  controls.update();
 
   const resize = () => {
     const width = ui.viewport.clientWidth;
@@ -249,6 +390,42 @@ async function bootstrap(): Promise<void> {
 
   window.addEventListener('resize', resize);
   resize();
+
+  const pressedKeys = new Set<string>();
+  const baseFlightSpeed = Math.max(assetSize.length() * 0.35, 2.5);
+  const worldUp = new Vector3(0, 1, 0);
+  const forward = new Vector3();
+  const right = new Vector3();
+  const movement = new Vector3();
+
+  window.addEventListener('keydown', (event) => {
+    if (event.repeat || isEditableTarget(event.target)) {
+      return;
+    }
+
+    if ([
+      'KeyW',
+      'KeyA',
+      'KeyS',
+      'KeyD',
+      'KeyQ',
+      'KeyE',
+      'Space',
+      'ShiftLeft',
+      'ShiftRight',
+    ].includes(event.code)) {
+      event.preventDefault();
+      pressedKeys.add(event.code);
+    }
+  });
+
+  window.addEventListener('keyup', (event) => {
+    pressedKeys.delete(event.code);
+  });
+
+  window.addEventListener('blur', () => {
+    pressedKeys.clear();
+  });
 
   scene.add(new AmbientLight(0xffffff, 1.1));
 
@@ -271,55 +448,69 @@ async function bootstrap(): Promise<void> {
   const heroSplat = new SplatMesh({
     source,
     material: new SplatMaterial({
-      pointSize: 6.4,
-      opacity: 0.96,
-      tint: 0xf7fbff,
+      pointSize: COMPLEX_SPLAT_PRESET.pointSize,
+      opacity: COMPLEX_SPLAT_PRESET.opacity,
+      tint: 0xffffff,
       debugMode: 'albedo',
     }),
-    effects: new SplatEffectStack([
-      {
-        id: 'spz-pulse',
-        kind: 'pulse',
-        intensity: 0.35,
-        frequencyHz: 0.16,
-        semanticMask: SPLAT_SEMANTIC_FLAGS.hero,
-      },
-      {
-        id: 'spz-glow',
-        kind: 'recolor',
-        intensity: 0.14,
-        tint: 0xe6f6ff,
-      },
-    ]),
     importance: 1.5,
   });
   heroSplat.position.set(-assetCenter.x, -importedAsset.localBoundsMin[1], -assetCenter.z);
   scene.add(heroSplat);
 
   const bridge = new SplatRendererBridge({
-    budgets: {
-      maxVisibleSplats: 24_000,
-      maxOverdrawBudget: 1_650,
-      maxActivePages: 24,
-      maxResidentPages: 40,
-      maxPageUploadsPerFrame: 3,
-    },
+    governor: new LockedQualityGovernor({
+      maxVisibleSplats: COMPLEX_SPLAT_PRESET.visibleBudget,
+      maxOverdrawBudget: COMPLEX_SPLAT_PRESET.overdrawBudget,
+      maxActivePages: COMPLEX_SPLAT_PRESET.activePages,
+      maxResidentPages: COMPLEX_SPLAT_PRESET.residentPages,
+      maxPageUploadsPerFrame: COMPLEX_SPLAT_PRESET.uploadsPerFrame,
+      minProjectedNodeSizePx: COMPLEX_SPLAT_PRESET.coverageBiasPx,
+      peripheralFoveation: COMPLEX_SPLAT_PRESET.peripheralFoveation,
+      heroTileBudget: COMPLEX_SPLAT_PRESET.heroTiles,
+      temporalStabilityBias: COMPLEX_SPLAT_PRESET.temporalStabilityBias,
+    }),
+    useGpuVisibility: COMPLEX_SPLAT_PRESET.useGpuVisibilityReadback,
   });
   scene.add(bridge);
 
   const clock = new Clock();
-  const target = new Vector3(0, assetSize.y * 0.38, 0);
 
   renderer.setAnimationLoop(() => {
     const deltaSeconds = clock.getDelta();
-    const elapsedSeconds = clock.getElapsedTime();
-    const orbitAngle = elapsedSeconds * 0.11;
-    camera.position.set(
-      Math.cos(orbitAngle) * orbitRadius,
-      Math.max(assetSize.y * 0.14, assetSize.y * 0.22 + Math.sin(elapsedSeconds * 0.21) * assetSize.y * 0.04),
-      Math.sin(orbitAngle) * orbitRadius * 0.72,
-    );
-    camera.lookAt(target);
+    movement.set(0, 0, 0);
+
+    if (pressedKeys.size > 0) {
+      forward.subVectors(controls.target, camera.position).normalize();
+      right.crossVectors(forward, camera.up).normalize();
+
+      if (pressedKeys.has('KeyW')) {
+        movement.add(forward);
+      }
+      if (pressedKeys.has('KeyS')) {
+        movement.sub(forward);
+      }
+      if (pressedKeys.has('KeyD')) {
+        movement.add(right);
+      }
+      if (pressedKeys.has('KeyA')) {
+        movement.sub(right);
+      }
+      if (pressedKeys.has('KeyE') || pressedKeys.has('Space')) {
+        movement.add(worldUp);
+      }
+      if (pressedKeys.has('KeyQ') || pressedKeys.has('ShiftLeft') || pressedKeys.has('ShiftRight')) {
+        movement.sub(worldUp);
+      }
+
+      if (movement.lengthSq() > 0) {
+        movement.normalize().multiplyScalar(baseFlightSpeed * deltaSeconds);
+        camera.position.add(movement);
+        controls.target.add(movement);
+      }
+    }
+
+    controls.update();
 
     const snapshot = bridge.update(scene, camera, deltaSeconds, renderer);
     updateHud(snapshot);

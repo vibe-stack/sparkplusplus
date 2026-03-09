@@ -87,14 +87,17 @@ export class SplatQualityGovernor {
     if (level >= 4) {
       budgets.effectUpdateCadence = 2;
       budgets.maxOverdrawBudget = Math.round(budgets.maxOverdrawBudget * 0.82);
+      budgets.maxPageUploadsPerFrame = Math.max(2, Math.round(budgets.maxPageUploadsPerFrame * 0.75));
     }
 
     if (level >= 5) {
       budgets.maxVisibleSplats = Math.round(budgets.maxVisibleSplats * 0.82);
+      budgets.maxActivePages = Math.max(12, Math.round(budgets.maxActivePages * 0.78));
     }
 
     if (level >= 6) {
       budgets.minProjectedNodeSizePx = Math.round(budgets.minProjectedNodeSizePx * 1.25);
+      budgets.maxResidentPages = Math.max(16, Math.round(budgets.maxResidentPages * 0.75));
     }
 
     if (level >= 7) {

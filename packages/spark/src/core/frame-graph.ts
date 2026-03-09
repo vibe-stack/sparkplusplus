@@ -5,11 +5,11 @@ export type SplatFramePassName =
   | 'lod-frontier-selection'
   | 'residency-request-emission'
   | 'active-page-expansion'
-  | 'debug-proxy-sync';
+  | 'baseline-compositor-sync';
 
 export interface SplatFramePassDescriptor {
   name: SplatFramePassName;
-  stage: 'cpu-bootstrap' | 'future-gpu';
+  stage: 'cpu-bootstrap' | 'gpu-visibility' | 'baseline-compositor';
   inputs: readonly string[];
   outputs: readonly string[];
 }
@@ -23,13 +23,13 @@ export const SPARK_FRAME_GRAPH: readonly SplatFramePassDescriptor[] = [
   },
   {
     name: 'object-cluster-update',
-    stage: 'cpu-bootstrap',
+    stage: 'gpu-visibility',
     inputs: ['scene descriptor buffer', 'cluster metadata buffer'],
     outputs: ['world-space cluster bounds', 'object-level score seeds'],
   },
   {
     name: 'cluster-cull-score',
-    stage: 'cpu-bootstrap',
+    stage: 'gpu-visibility',
     inputs: ['camera frustum', 'cluster bounds', 'temporal cache'],
     outputs: ['visible cluster candidates', 'priority scores'],
   },
@@ -52,9 +52,9 @@ export const SPARK_FRAME_GRAPH: readonly SplatFramePassDescriptor[] = [
     outputs: ['active page list', 'renderable splat count'],
   },
   {
-    name: 'debug-proxy-sync',
-    stage: 'cpu-bootstrap',
+    name: 'baseline-compositor-sync',
+    stage: 'baseline-compositor',
     inputs: ['active page list', 'material/effect stack'],
-    outputs: ['THREE.Points debug proxy'],
+    outputs: ['sprite tile queues', 'weighted/hero compositor instances'],
   },
 ] as const;
