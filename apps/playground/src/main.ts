@@ -1,13 +1,10 @@
 import './style.css';
 import {
-  SPARK_ENGINE_DESCRIPTOR,
-  SPARK_FRAME_GRAPH,
   SplatMaterial,
   SplatMesh,
   SplatQualityGovernor,
   SplatRendererBridge,
   SpzSplatSource,
-  getSparkBanner,
   type SplatFrameStatsSnapshot,
 } from '@sparkplusplus/spark';
 import {
@@ -31,7 +28,6 @@ import { WebGPURenderer } from 'three/webgpu';
 const app = document.querySelector<HTMLDivElement>('#app');
 
 interface PlaygroundComplexSplatPreset {
-  name: string;
   importPointCap: number | null;
   pageCapacity: number;
   visibleBudget: number;
@@ -53,7 +49,6 @@ interface PlaygroundComplexSplatPreset {
 }
 
 const COMPLEX_SPLAT_PRESET: PlaygroundComplexSplatPreset = {
-  name: 'Coverage',
   importPointCap: null,
   pageCapacity: 8_192,
   visibleBudget: 4_000_000,
@@ -75,7 +70,7 @@ const COMPLEX_SPLAT_PRESET: PlaygroundComplexSplatPreset = {
 };
 
 class LockedQualityGovernor extends SplatQualityGovernor {
-  override observe(snapshot: SplatFrameStatsSnapshot) {
+  override observe(_snapshot: SplatFrameStatsSnapshot) {
     return {
       level: this.getLevel(),
       reason: 'locked',
@@ -88,170 +83,15 @@ if (!app) {
   throw new Error('Missing #app root');
 }
 
-app.innerHTML = `
-  <div class="app-shell">
-    <aside class="hud">
-      <section class="stack-card hero-card">
-        <p class="eyebrow">Spark++ milestone bootstrap</p>
-        <h1>${getSparkBanner()}</h1>
-        <p class="body">
-          The demo imports the real <strong>demo.spz</strong> asset, runs GPU cluster visibility/scoring,
-          and draws the active frontier through the baseline sprite compositor while ordinary three.js meshes
-          still share the same scene.
-        </p>
-      </section>
+app.innerHTML = '<div id="viewport" class="viewport"></div>';
 
-      <section class="stack-card">
-        <div class="card-header">
-          <h2>Frame Telemetry</h2>
-          <span class="pill">${SPARK_ENGINE_DESCRIPTOR.stage}</span>
-        </div>
-        <dl class="metric-grid">
-          <div>
-            <dt>CPU frame</dt>
-            <dd id="metric-frame">0.0 ms</dd>
-          </div>
-          <div>
-            <dt>GPU visibility</dt>
-            <dd id="metric-gpu">warming up</dd>
-          </div>
-          <div>
-            <dt>Scheduler</dt>
-            <dd id="metric-scheduler">CPU</dd>
-          </div>
-          <div>
-            <dt>Visible splats</dt>
-            <dd id="metric-splats">0</dd>
-          </div>
-          <div>
-            <dt>Active pages</dt>
-            <dd id="metric-pages">0</dd>
-          </div>
-          <div>
-            <dt>Resident pages</dt>
-            <dd id="metric-resident">0</dd>
-          </div>
-          <div>
-            <dt>Page uploads</dt>
-            <dd id="metric-uploads">0</dd>
-          </div>
-          <div>
-            <dt>Page fault rate</dt>
-            <dd id="metric-faults">0%</dd>
-          </div>
-          <div>
-            <dt>Frontier stability</dt>
-            <dd id="metric-stability">0%</dd>
-          </div>
-          <div>
-            <dt>Tile mix</dt>
-            <dd id="metric-tiles">0 active</dd>
-          </div>
-          <div>
-            <dt>Queues</dt>
-            <dd id="metric-queues">W0 · H0</dd>
-          </div>
-          <div>
-            <dt>Governor</dt>
-            <dd id="metric-governor">L0</dd>
-          </div>
-        </dl>
-      </section>
+const viewportElement = app.querySelector<HTMLDivElement>('#viewport');
 
-      <section class="stack-card">
-        <div class="card-header">
-          <h2>Scene Budget</h2>
-          <span class="pill" id="budget-object-count">0 objects</span>
-        </div>
-        <div class="budget-strip" id="budget-strip">
-          waiting for first frame
-        </div>
-        <div class="mesh-list" id="mesh-list"></div>
-      </section>
-
-      <section class="stack-card">
-        <div class="card-header">
-          <h2>Frame Graph</h2>
-          <span class="pill">${SPARK_FRAME_GRAPH.length} passes</span>
-        </div>
-        <ol class="pipeline-list">
-          ${SPARK_FRAME_GRAPH.map((pass) => `<li><strong>${pass.name}</strong><span>${pass.stage}</span></li>`).join('')}
-        </ol>
-      </section>
-    </aside>
-
-    <main class="stage-panel">
-      <div class="viewport-shell">
-        <div id="viewport" class="viewport"></div>
-        <div class="stage-caption">
-          <p class="eyebrow">three.js scene semantics intact</p>
-          <h2>Composite LoD selection, page residency, and triangle mesh coexistence</h2>
-        </div>
-      </div>
-    </main>
-  </div>
-`;
-
-const viewport = app.querySelector<HTMLDivElement>('#viewport');
-const metricFrame = app.querySelector<HTMLElement>('#metric-frame');
-const metricGpu = app.querySelector<HTMLElement>('#metric-gpu');
-const metricScheduler = app.querySelector<HTMLElement>('#metric-scheduler');
-const metricSplats = app.querySelector<HTMLElement>('#metric-splats');
-const metricPages = app.querySelector<HTMLElement>('#metric-pages');
-const metricResident = app.querySelector<HTMLElement>('#metric-resident');
-const metricUploads = app.querySelector<HTMLElement>('#metric-uploads');
-const metricFaults = app.querySelector<HTMLElement>('#metric-faults');
-const metricStability = app.querySelector<HTMLElement>('#metric-stability');
-const metricTiles = app.querySelector<HTMLElement>('#metric-tiles');
-const metricQueues = app.querySelector<HTMLElement>('#metric-queues');
-const metricGovernor = app.querySelector<HTMLElement>('#metric-governor');
-const budgetObjectCount = app.querySelector<HTMLElement>('#budget-object-count');
-const budgetStrip = app.querySelector<HTMLElement>('#budget-strip');
-const meshList = app.querySelector<HTMLDivElement>('#mesh-list');
-
-if (
-  !viewport
-  || !metricFrame
-  || !metricGpu
-  || !metricScheduler
-  || !metricSplats
-  || !metricPages
-  || !metricResident
-  || !metricUploads
-  || !metricFaults
-  || !metricStability
-  || !metricTiles
-  || !metricQueues
-  || !metricGovernor
-  || !budgetObjectCount
-  || !budgetStrip
-  || !meshList
-) {
-  throw new Error('Playground UI is incomplete');
+if (!viewportElement) {
+  throw new Error('Missing viewport root');
 }
 
-const ui = {
-  viewport,
-  metricFrame,
-  metricGpu,
-  metricScheduler,
-  metricSplats,
-  metricPages,
-  metricResident,
-  metricUploads,
-  metricFaults,
-  metricStability,
-  metricTiles,
-  metricQueues,
-  metricGovernor,
-  budgetObjectCount,
-  budgetStrip,
-  meshList,
-};
-
-function formatInteger(value: number): string {
-  return new Intl.NumberFormat('en-US').format(Math.round(value));
-}
+const viewport: HTMLDivElement = viewportElement;
 
 function isEditableTarget(target: EventTarget | null): boolean {
   return target instanceof HTMLElement && (
@@ -262,66 +102,9 @@ function isEditableTarget(target: EventTarget | null): boolean {
   );
 }
 
-function updateHud(snapshot: SplatFrameStatsSnapshot): void {
-  ui.metricFrame.textContent = `${snapshot.cpuFrameMs.toFixed(2)} ms`;
-  ui.metricGpu.textContent = snapshot.gpuVisibilityReady
-    ? `ready · ${snapshot.gpuClusterCount} clusters · ${snapshot.gpuVisibilityFrameLag}f lag`
-    : snapshot.gpuVisibilityPending
-      ? 'dispatching'
-      : 'cpu fallback';
-  ui.metricScheduler.textContent = snapshot.schedulerMode === 'gpu-readback' ? 'GPU readback' : 'CPU bootstrap';
-  ui.metricSplats.textContent = formatInteger(snapshot.visibleSplats);
-  ui.metricPages.textContent = `${snapshot.activePages} / ${snapshot.budgets.maxActivePages}`;
-  ui.metricResident.textContent = `${snapshot.residentPages} / ${snapshot.budgets.maxResidentPages}`;
-  ui.metricUploads.textContent = `${snapshot.pageUploads} / ${snapshot.budgets.maxPageUploadsPerFrame}`;
-  ui.metricFaults.textContent = `${(snapshot.pageFaultRate * 100).toFixed(0)}%`;
-  ui.metricStability.textContent = `${(snapshot.frontierStability * 100).toFixed(0)}%`;
-  ui.metricTiles.textContent = [
-    `${snapshot.compositorActiveTiles} active`,
-    `${snapshot.compositorHeroTiles} hero`,
-    `${snapshot.compositorDepthSlicedTiles} depth`,
-  ].join(' · ');
-  ui.metricQueues.textContent = [
-    `W${formatInteger(snapshot.compositorWeightedInstances)}`,
-    `H${formatInteger(snapshot.compositorHeroInstances)}`,
-    `D${formatInteger(snapshot.compositorDepthSlicedInstances)}`,
-  ].join(' · ');
-  ui.metricGovernor.textContent = `L${snapshot.appliedGovernorLevel} · ${snapshot.governorReason}`;
-  ui.budgetObjectCount.textContent = `${snapshot.meshCount} objects`;
-  ui.budgetStrip.textContent = [
-    `${formatInteger(snapshot.budgets.maxVisibleSplats)} splat budget`,
-    `${snapshot.estimatedOverdraw.toFixed(0)} / ${snapshot.budgets.maxOverdrawBudget} overdraw`,
-    `${snapshot.compositorWeightedTiles}/${snapshot.compositorDepthSlicedTiles}/${snapshot.compositorHeroTiles} tile classes`,
-    `${(snapshot.sceneDescriptorBytes / 1024).toFixed(1)} KB scene descriptors`,
-    `${((snapshot.clusterMetadataBytes + snapshot.pageDescriptorBytes + snapshot.residencyBytes) / 1024).toFixed(1)} KB runtime buffers`,
-  ].join(' · ');
-
-  ui.meshList.innerHTML = snapshot.meshStats
-    .map((mesh) => `
-      <article class="mesh-card">
-        <div class="mesh-title">
-          <strong>${mesh.meshName}</strong>
-          <span>${mesh.visibleSplats} splats</span>
-        </div>
-        <p>
-          frontier ${mesh.frontierClusters} · active ${mesh.activePages} · resident ${mesh.residentPages} ·
-          requested ${mesh.requestedPages} · stability ${(mesh.frontierStability * 100).toFixed(0)}%
-        </p>
-        <p>
-          queues W${formatInteger(mesh.weightedInstances)} · H${formatInteger(mesh.heroInstances)} ·
-          D${formatInteger(mesh.depthSlicedInstances)} · tiles ${mesh.activeTiles} active /
-          ${mesh.heroTiles} hero / ${mesh.depthSlicedTiles} depth
-        </p>
-      </article>
-    `)
-    .join('');
-}
-
 async function bootstrap(): Promise<void> {
   const scene = new Scene();
   scene.background = new Color(0x050814);
-
-  ui.budgetStrip.textContent = 'Loading /demo.spz and building paged runtime asset...';
 
   const source = await SpzSplatSource.fromUrl('/demo.spz', {
     label: 'Demo SPZ',
@@ -332,18 +115,6 @@ async function bootstrap(): Promise<void> {
     branching: 4,
   });
   const importedAsset = source.buildAsset();
-  const sampledPoints = COMPLEX_SPLAT_PRESET.importPointCap === null
-    ? source.header.pointCount
-    : Math.min(source.header.pointCount, COMPLEX_SPLAT_PRESET.importPointCap);
-  ui.budgetStrip.textContent = [
-    `${COMPLEX_SPLAT_PRESET.name} preset`,
-    `Loaded ${formatInteger(source.header.pointCount)} source splats`,
-    sampledPoints === source.header.pointCount
-      ? 'full-resolution import'
-      : `sampling ${formatInteger(sampledPoints)} into runtime pages`,
-    `${COMPLEX_SPLAT_PRESET.pageCapacity}-splat pages`,
-    `${COMPLEX_SPLAT_PRESET.coverageBiasPx}px coverage bias`,
-  ].join(' · ');
   const assetBounds = new Box3(
     new Vector3(...importedAsset.localBoundsMin),
     new Vector3(...importedAsset.localBoundsMax),
@@ -368,7 +139,7 @@ async function bootstrap(): Promise<void> {
   renderer.outputColorSpace = SRGBColorSpace;
   renderer.toneMapping = ACESFilmicToneMapping;
   renderer.domElement.classList.add('viewport-canvas');
-  ui.viewport.append(renderer.domElement);
+  viewport.append(renderer.domElement);
   await renderer.init();
 
   const controls = new OrbitControls(camera, renderer.domElement);
@@ -380,8 +151,8 @@ async function bootstrap(): Promise<void> {
   controls.update();
 
   const resize = () => {
-    const width = ui.viewport.clientWidth;
-    const height = ui.viewport.clientHeight;
+    const width = viewport.clientWidth;
+    const height = viewport.clientHeight;
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     renderer.setSize(width, height);
     camera.aspect = width / height;
@@ -511,14 +282,13 @@ async function bootstrap(): Promise<void> {
     }
 
     controls.update();
-
-    const snapshot = bridge.update(scene, camera, deltaSeconds, renderer);
-    updateHud(snapshot);
+    bridge.update(scene, camera, deltaSeconds, renderer);
     renderer.render(scene, camera);
   });
 }
 
 void bootstrap().catch((error: unknown) => {
+  console.error(error);
   const message = error instanceof Error ? error.message : 'Unknown bootstrap failure';
-  ui.budgetStrip.textContent = `Boot failed: ${message}`;
+  app.innerHTML = `<div class="boot-error">Boot failed: ${message}</div>`;
 });
