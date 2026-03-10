@@ -107,7 +107,7 @@ async function bootstrap(): Promise<void> {
   const scene = new Scene();
   scene.background = new Color(0x050814);
 
-  const source = await SpzSplatSource.fromUrl('/demo.spz', {
+  const source = await SpzSplatSource.fromUrl(`${import.meta.env.BASE_URL}demo.spz`, {
     label: 'Demo SPZ',
     ...(COMPLEX_SPLAT_PRESET.importPointCap === null
       ? {}

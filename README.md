@@ -39,3 +39,11 @@ bun run dev
 bun run build
 bun run typecheck
 ```
+
+## Playground deployment
+
+The playground is configured for GitHub Pages at:
+
+`https://vibe-stack.github.io/sparkplusplus`
+
+The repository includes a GitHub Actions workflow that builds with Bun and deploys `apps/playground/dist` to Pages on pushes to `main`.

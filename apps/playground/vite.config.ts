@@ -1,7 +1,8 @@
 import { defineConfig } from 'vite';
 import { fileURLToPath, URL } from 'node:url';
 
-export default defineConfig({
+export default defineConfig(({ command }) => ({
+  base: command === 'build' ? '/sparkplusplus/' : '/',
   server: {
     // just allow all hosts
     allowedHosts: true,
@@ -13,4 +14,4 @@ export default defineConfig({
       ),
     },
   },
-});
+}));
