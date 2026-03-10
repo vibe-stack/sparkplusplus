@@ -14,6 +14,7 @@ export interface SpzHeader {
 export interface SpzImportOptions {
   label?: string;
   pageCapacity?: number;
+  proxyPageCapacity?: number;
   maxPoints?: number;
   branching?: number;
   minLeafPoints?: number;
@@ -91,6 +92,10 @@ function parseSpzBuffer(buffer: ArrayBuffer, options: SpzImportOptions): {
 
   const pointCloud = samplePointCloud(view, header, options.maxPoints ?? header.pointCount);
   const pageCapacity = Math.max(256, options.pageCapacity ?? 1_024);
+  const proxyPageCapacity = Math.max(
+    pageCapacity,
+    options.proxyPageCapacity ?? Math.min(8_192, Math.max(pageCapacity * 2, 4_096)),
+  );
   const branching = Math.max(2, Math.min(8, options.branching ?? 4));
   const minLeafPoints = Math.max(
     256,
@@ -100,6 +105,7 @@ function parseSpzBuffer(buffer: ArrayBuffer, options: SpzImportOptions): {
     id: `spz:${options.label ?? 'demo'}`,
     label: options.label ?? 'Demo SPZ',
     pageCapacity,
+    proxyPageCapacity,
     branching,
     minLeafPoints,
   });
@@ -249,6 +255,7 @@ function buildPagedAssetFromPointCloud(
     id: string;
     label: string;
     pageCapacity: number;
+    proxyPageCapacity: number;
     branching: number;
     minLeafPoints: number;
   },
@@ -286,8 +293,12 @@ function buildPagedAssetFromPointCloud(
     const effectiveCapacity = isLeaf
       ? options.pageCapacity
       : Math.min(
-          options.pageCapacity,
-          Math.max(1_024, Math.min(2_048, Math.ceil(Math.sqrt(count) * 4))),
+          options.proxyPageCapacity,
+          Math.max(
+            options.pageCapacity,
+            Math.ceil(Math.sqrt(count) * 8),
+            Math.ceil(count / 96),
+          ),
         );
     const pageId = pages.length;
     const page = createPageFromRange(
@@ -509,21 +520,26 @@ function createPageFromRange(
       const bucketCount = Math.max(1, bucketEnd - bucketStart);
       const normalizedWeight = Math.max(1e-5, weightSum);
       const averageOpacity = opacityMass / bucketCount;
+      const accumulatedOpacity = 1 - Math.exp(-opacityMass * 0.22);
       const averageScaleX = scaleX / normalizedWeight;
       const averageScaleY = scaleY / normalizedWeight;
       const averageScaleZ = scaleZ / normalizedWeight;
       const averageScale = (averageScaleX + averageScaleY + averageScaleZ) / 3;
-      const extentScaleX = (bucketBoundsMax[0] - bucketBoundsMin[0]) * 0.12;
-      const extentScaleY = (bucketBoundsMax[1] - bucketBoundsMin[1]) * 0.12;
-      const extentScaleZ = (bucketBoundsMax[2] - bucketBoundsMin[2]) * 0.12;
-      const proxyScaleCap = Math.max(0.01, averageScale * 2.2);
+      const proxyDensityBoost = 1 + Math.min(1.6, Math.log2(bucketCount + 1) * 0.22);
+      const extentScaleX = (bucketBoundsMax[0] - bucketBoundsMin[0]) * 0.28;
+      const extentScaleY = (bucketBoundsMax[1] - bucketBoundsMin[1]) * 0.28;
+      const extentScaleZ = (bucketBoundsMax[2] - bucketBoundsMin[2]) * 0.28;
+      const proxyScaleCap = Math.max(
+        0.02,
+        averageScale * (2.8 + Math.min(1.8, Math.log2(bucketCount + 1) * 0.35)),
+      );
 
       positions[targetOffset + 0] = positionX / normalizedWeight;
       positions[targetOffset + 1] = positionY / normalizedWeight;
       positions[targetOffset + 2] = positionZ / normalizedWeight;
-      scales[targetOffset + 0] = Math.min(proxyScaleCap, Math.max(averageScaleX * 1.1, extentScaleX));
-      scales[targetOffset + 1] = Math.min(proxyScaleCap, Math.max(averageScaleY * 1.1, extentScaleY));
-      scales[targetOffset + 2] = Math.min(proxyScaleCap, Math.max(averageScaleZ * 1.1, extentScaleZ));
+      scales[targetOffset + 0] = Math.min(proxyScaleCap, Math.max(averageScaleX * proxyDensityBoost, extentScaleX));
+      scales[targetOffset + 1] = Math.min(proxyScaleCap, Math.max(averageScaleY * proxyDensityBoost, extentScaleY));
+      scales[targetOffset + 2] = Math.min(proxyScaleCap, Math.max(averageScaleZ * proxyDensityBoost, extentScaleZ));
       writeNormalizedQuaternion(
         rotations,
         sampleIndex * 4,
@@ -535,7 +551,10 @@ function createPageFromRange(
       colors[targetOffset + 0] = colorR / normalizedWeight;
       colors[targetOffset + 1] = colorG / normalizedWeight;
       colors[targetOffset + 2] = colorB / normalizedWeight;
-      opacities[sampleIndex] = Math.max(0.06, Math.min(0.42, averageOpacity * 0.5));
+      opacities[sampleIndex] = Math.max(
+        0.12,
+        Math.min(0.98, Math.max(averageOpacity * 0.9, accumulatedOpacity)),
+      );
 
       for (let axis = 0; axis < 3; axis += 1) {
         boundsMin[axis] = Math.min(boundsMin[axis]!, bucketBoundsMin[axis]!);

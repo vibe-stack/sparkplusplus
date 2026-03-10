@@ -31,6 +31,7 @@ const app = document.querySelector<HTMLDivElement>('#app');
 interface PlaygroundComplexSplatPreset {
   importPointCap: number | null;
   pageCapacity: number;
+  proxyPageCapacity: number;
   minLeafPoints: number;
   branching: number;
   visibleBudget: number;
@@ -58,33 +59,35 @@ interface PlaygroundComplexSplatPreset {
 const COMPLEX_SPLAT_PRESET: PlaygroundComplexSplatPreset = {
   importPointCap: null,
   pageCapacity: 1_024,
-  minLeafPoints: 1024,
+  proxyPageCapacity: 1_024,
+  minLeafPoints: 1_024,
   branching: 8,
   visibleBudget: 1_000_000,
-  overdrawBudget: 260_000,
-  activePages: 768,
+  overdrawBudget: 50_000,
+  activePages: 1_536,
   residentPages: 2_048,
   uploadsPerFrame: 320,
-  minProjectedNodeSizePx: 3,
-  peripheralFoveation: 2.2,
+  minProjectedNodeSizePx: 1,
+  peripheralFoveation: 1.15,
   heroTiles: 0,
-  temporalStabilityBias: 1.2,
-  pointSize: 5.15,
+  temporalStabilityBias: 1.6,
+  pointSize: 7,
   opacity: 1,
-  colorGain: 1.23,
+  colorGain: 2,
   targetFrameMs: 32,
   minPixelRatio: 0.5,
-  maxPixelRatio: 1.5,
+  maxPixelRatio: 1.25,
   useGpuVisibilityReadback: false,
-  orbitRadiusScale: 0.96,
-  orbitHeightScale: 0.28,
-  orbitDepthScale: 0.88,
-  lookHeightScale: 0.38,
+  orbitRadiusScale: 0.72,
+  orbitHeightScale: 0.22,
+  orbitDepthScale: 0.64,
+  lookHeightScale: 0.32,
 };
 
 const DEBUG_MODES: readonly SplatDebugMode[] = [
   'albedo',
   'lod',
+  'representation',
   'semantic',
   'tile-occupancy',
   'tile-heatmap',
@@ -135,6 +138,7 @@ async function bootstrap(): Promise<void> {
       ? {}
       : { maxPoints: COMPLEX_SPLAT_PRESET.importPointCap }),
     pageCapacity: COMPLEX_SPLAT_PRESET.pageCapacity,
+    proxyPageCapacity: COMPLEX_SPLAT_PRESET.proxyPageCapacity,
     minLeafPoints: COMPLEX_SPLAT_PRESET.minLeafPoints,
     branching: COMPLEX_SPLAT_PRESET.branching,
   });
@@ -377,16 +381,16 @@ async function bootstrap(): Promise<void> {
     const snapshot = bridge.update(splatScene, camera, deltaSeconds, renderer);
     applyRendererScale(snapshot.budgets.renderScale);
     const meshSnapshot = snapshot.meshStats[0];
-    debugHud.textContent = [
-      `mode ${heroSplat.splatMaterial.debugMode}`,
-      `visible clusters ${meshSnapshot?.visibleClusters ?? 0}`,
-      `binned refs ${meshSnapshot?.binnedClusterReferences ?? 0}`,
-      `overflow tiles ${meshSnapshot?.overflowedTiles ?? 0}`,
-      `tile peak ${meshSnapshot?.maxTileSplatEstimate ?? 0}`,
-      `tile size ${snapshot.budgets.tileSizePx}px / tile cap ${snapshot.budgets.maxSplatsPerTile}`,
-      `tile bytes ${Math.round((meshSnapshot?.tileBufferBytes ?? 0) / 1024)} KB`,
-      'keys 1-7 or ` to cycle',
-    ].join('\n');
+    // debugHud.textContent = [
+    //   `mode ${heroSplat.splatMaterial.debugMode}`,
+    //   `visible clusters ${meshSnapshot?.visibleClusters ?? 0}`,
+    //   `binned refs ${meshSnapshot?.binnedClusterReferences ?? 0}`,
+    //   `overflow tiles ${meshSnapshot?.overflowedTiles ?? 0}`,
+    //   `tile peak ${meshSnapshot?.maxTileSplatEstimate ?? 0}`,
+    //   `tile size ${snapshot.budgets.tileSizePx}px / tile cap ${snapshot.budgets.maxSplatsPerTile}`,
+    //   `tile bytes ${Math.round((meshSnapshot?.tileBufferBytes ?? 0) / 1024)} KB`,
+    //   'keys 1-8 or ` to cycle',
+    // ].join('\n');
     postProcessing.render();
   });
 }

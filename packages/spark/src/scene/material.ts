@@ -3,6 +3,7 @@ import { Color, type ColorRepresentation } from 'three';
 export type SplatDebugMode =
   | 'albedo'
   | 'lod'
+  | 'representation'
   | 'semantic'
   | 'tile-occupancy'
   | 'tile-heatmap'

@@ -140,6 +140,8 @@ const COMPUTE_ALPHA_CUTOFF = 0.992;
 export class SplatSpriteCompositor {
   private readonly preparedPageCache = new Map<number, PreparedPageCache>();
   private readonly tileBinner = new SplatClusterTileBinner();
+  private readonly depthSortIndexCache = new Map<number, Uint32Array>();
+  private readonly depthSortValueCache = new Map<number, Float32Array>();
 
   private cpuSprite: Sprite | undefined;
   private cpuMaterial: SpriteNodeMaterial | undefined;
@@ -194,6 +196,7 @@ export class SplatSpriteCompositor {
   private readonly computeOverlayQuaternion = new Quaternion();
   private readonly computeForward = new Vector3();
   private readonly computeOwnerInverseMatrix = new Matrix4();
+  private readonly depthSortModelView = new Matrix4();
   private snapshot: SplatCompositorSnapshot = EMPTY_SNAPSHOT;
   private lastBuildSignature = '';
   private lastReductionHash = 2166136261;
@@ -241,24 +244,30 @@ export class SplatSpriteCompositor {
       ? Math.floor(context.frameIndex / Math.max(1, context.budgets.effectUpdateCadence))
       : 0;
     const computeMainPath = this.shouldUseComputeMainPath(context, tileBinning);
+    const alphaSortedMainPath = !computeMainPath
+      && (this.owner.splatMaterial.debugMode === 'albedo' || this.owner.splatMaterial.debugMode === 'cluster-bounds');
+    const renderActiveClusters = alphaSortedMainPath
+      ? this.sortClustersBackToFront(clusteredActiveClusters, tileBinning)
+      : clusteredActiveClusters;
     const rebuildDependsOnBinning = this.owner.splatMaterial.debugMode === 'tile-occupancy'
       || this.owner.splatMaterial.debugMode === 'tile-heatmap'
       || this.owner.splatMaterial.debugMode === 'depth-buckets';
     const buildSignature = [
-      clusteredActiveClusters.map((cluster) => cluster.clusterId).join(','),
+      renderActiveClusters.map((cluster) => cluster.clusterId).join(','),
       this.owner.getMaterialVersion(),
       this.owner.getEffectVersion(),
       frameBucket,
       computeMainPath ? 'compute' : 'fallback',
       `${tileBinning.columns}x${tileBinning.rows}@${tileBinning.tileSizePx}`,
-      rebuildDependsOnBinning || computeMainPath ? tileBinning.debugHash : 'static',
+      rebuildDependsOnBinning || computeMainPath || alphaSortedMainPath ? tileBinning.debugHash : 'static',
+      alphaSortedMainPath ? this.resolveCameraOrderingSignature(context.camera) : 'static-camera',
       this.lastReductionHash,
     ].join('::');
 
     this.syncClusterBoundsOverlay(tileBinning);
     this.snapshot = this.buildSnapshot(0, tileBinning);
 
-    if (clusteredActiveClusters.length === 0) {
+    if (renderActiveClusters.length === 0) {
       this.lastBuildSignature = '';
       this.computeTileBufferSignature = '';
       this.computeTileFrame = {
@@ -303,14 +312,14 @@ export class SplatSpriteCompositor {
     this.lastBuildSignature = buildSignature;
 
     if (this.canUseGpuMainPath(context)) {
-      this.syncGpuTilePath(clusteredActiveClusters, clusterSamplingStride, tileBinning);
+      this.syncGpuTilePath(renderActiveClusters, clusterSamplingStride, tileBinning, context.camera);
       this.syncSprite(0);
       return;
     }
 
     let queueEstimate = 0;
 
-    for (const activeCluster of clusteredActiveClusters) {
+    for (const activeCluster of renderActiveClusters) {
       const page = asset.pages[activeCluster.pageId]!;
       const samplingStride = clusterSamplingStride.get(activeCluster.clusterId) ?? 1;
       queueEstimate += Math.ceil(page.splatCount / samplingStride);
@@ -320,16 +329,19 @@ export class SplatSpriteCompositor {
 
     let instanceCount = 0;
 
-    for (const activeCluster of clusteredActiveClusters) {
+    for (const activeCluster of renderActiveClusters) {
       const cluster = asset.clusters[activeCluster.clusterId]!;
       const page = asset.pages[activeCluster.pageId]!;
       const preparedPage = canUsePreparedPages ? this.getPreparedPageCache(page) : null;
       const projectedCluster = tileBinning.clusterProjections.get(cluster.id) ?? null;
       const samplingStride = clusterSamplingStride.get(cluster.id) ?? 1;
+      const depthSortedIndices = alphaSortedMainPath && this.shouldDepthSortCluster(cluster, projectedCluster, samplingStride)
+        ? this.getDepthSortedPageIndices(page, context.camera)
+        : null;
       const densityCompensation = this.resolveDensityCompensation(samplingStride);
       const coverageScaleBoost = this.resolveCoverageScaleBoost(cluster, densityCompensation);
 
-      if (preparedPage && samplingStride === 1) {
+      if (preparedPage && !depthSortedIndices && samplingStride === 1) {
         this.copyPreparedPage(
           page.positions,
           preparedPage.baseScales,
@@ -343,7 +355,7 @@ export class SplatSpriteCompositor {
         continue;
       }
 
-      if (preparedPage) {
+      if (preparedPage && !depthSortedIndices) {
         instanceCount += this.copyPreparedPageStrided(
           preparedPage,
           page.positions,
@@ -354,10 +366,25 @@ export class SplatSpriteCompositor {
         continue;
       }
 
+      if (preparedPage && depthSortedIndices) {
+        instanceCount += this.copyPreparedPageDepthSorted(
+          preparedPage,
+          page.positions,
+          depthSortedIndices,
+          instanceCount,
+          samplingStride,
+          coverageScaleBoost,
+        );
+        continue;
+      }
+
       const resolvedEffects = this.owner.effectStack.evaluate(cluster.semanticMask, context.timeSeconds);
       this.effectTintScratch.copy(resolvedEffects.tint);
+      const splatOrder = depthSortedIndices ?? null;
+      const splatIterations = splatOrder ? splatOrder.length : page.splatCount;
 
-      for (let splatIndex = 0; splatIndex < page.splatCount; splatIndex += samplingStride) {
+      for (let orderIndex = 0; orderIndex < splatIterations; orderIndex += samplingStride) {
+        const splatIndex = splatOrder ? splatOrder[orderIndex]! : orderIndex;
         const sourceOffset = splatIndex * 3;
         const rotationOffset = splatIndex * 4;
 
@@ -381,6 +408,10 @@ export class SplatSpriteCompositor {
           } else {
             this.colorScratch.set(0xf8fafc);
           }
+        }
+
+        if (this.owner.splatMaterial.debugMode === 'representation') {
+          this.resolveRepresentationDebugColor(this.colorScratch, cluster);
         }
 
         if (
@@ -1146,6 +1177,7 @@ export class SplatSpriteCompositor {
     clusteredActiveClusters: ReadonlyArray<SplatMeshSelection['activeClusters'][number]>,
     clusterSamplingStride: ReadonlyMap<number, number>,
     tileBinning: SplatClusterTileBinningSnapshot,
+    camera: Camera,
   ): void {
     const asset = this.owner.getAsset();
     let instanceCount = 0;
@@ -1170,6 +1202,23 @@ export class SplatSpriteCompositor {
       const scaleMultiplier = this.resolveCoverageScaleBoost(cluster, densityCompensation);
       const pageDescriptorOffset = page.id * 8;
       const pageSplatOffset = asset.buffers.pageDescriptors[pageDescriptorOffset + 6] ?? 0;
+      const projectedCluster = tileBinning.clusterProjections.get(cluster.id) ?? null;
+      const depthSortedIndices = this.shouldDepthSortCluster(cluster, projectedCluster, samplingStride)
+        ? this.getDepthSortedPageIndices(page, camera)
+        : null;
+
+      if (depthSortedIndices) {
+        for (let orderIndex = 0; orderIndex < depthSortedIndices.length; orderIndex += samplingStride) {
+          const splatIndex = depthSortedIndices[orderIndex]!;
+          const offset = cursor * 4;
+          selectionArray[offset + 0] = pageSplatOffset + splatIndex;
+          selectionArray[offset + 1] = cluster.id;
+          selectionArray[offset + 2] = scaleMultiplier;
+          selectionArray[offset + 3] = 0;
+          cursor += 1;
+        }
+        continue;
+      }
 
       for (let splatIndex = 0; splatIndex < page.splatCount; splatIndex += samplingStride) {
         const offset = cursor * 4;
@@ -1457,6 +1506,22 @@ export class SplatSpriteCompositor {
 
     const bucketMix = projectedCluster.depthBucket / Math.max(1, tileBinning.depthBucketCount - 1);
     target.setHSL(0.75 - bucketMix * 0.55, 0.78, 0.6);
+  }
+
+  private resolveRepresentationDebugColor(
+    target: Color,
+    cluster: ReturnType<SplatMesh['getAsset']>['clusters'][number],
+  ): void {
+    const representationRatio = cluster.representedSplatCount / Math.max(1, cluster.splatCount);
+    const leafCluster = cluster.childIds.length === 0;
+
+    if (leafCluster || representationRatio <= 1.1) {
+      target.set(0x93c5fd);
+      return;
+    }
+
+    const proxyMix = Math.min(1, Math.log2(Math.max(1, representationRatio)) / 4);
+    target.setHSL(0.56 - proxyMix * 0.48, 0.82, 0.58);
   }
 
   private syncClusterBoundsOverlay(tileBinning: SplatClusterTileBinningSnapshot): void {
@@ -1760,6 +1825,143 @@ export class SplatSpriteCompositor {
     return written;
   }
 
+  private copyPreparedPageDepthSorted(
+    preparedPage: PreparedPageCache,
+    sourcePositions: Float32Array,
+    sortedIndices: Uint32Array,
+    targetInstanceOffset: number,
+    samplingStride: number,
+    scaleMultiplier: number,
+  ): number {
+    let written = 0;
+
+    for (let orderIndex = 0; orderIndex < sortedIndices.length; orderIndex += samplingStride) {
+      const splatIndex = sortedIndices[orderIndex]!;
+      const sourceOffset = splatIndex * 3;
+      const rotationOffset = splatIndex * 4;
+      const targetIndex = targetInstanceOffset + written;
+
+      this.writeInstance(
+        targetIndex,
+        sourcePositions[sourceOffset + 0]!,
+        sourcePositions[sourceOffset + 1]!,
+        sourcePositions[sourceOffset + 2]!,
+        preparedPage.baseScales[sourceOffset + 0]! * scaleMultiplier,
+        preparedPage.baseScales[sourceOffset + 1]! * scaleMultiplier,
+        preparedPage.baseScales[sourceOffset + 2]! * scaleMultiplier,
+        preparedPage.rotations[rotationOffset + 0]!,
+        preparedPage.rotations[rotationOffset + 1]!,
+        preparedPage.rotations[rotationOffset + 2]!,
+        preparedPage.rotations[rotationOffset + 3]!,
+        this.colorScratch.setRGB(
+          preparedPage.colors[sourceOffset + 0]!,
+          preparedPage.colors[sourceOffset + 1]!,
+          preparedPage.colors[sourceOffset + 2]!,
+        ),
+        preparedPage.opacities[splatIndex]!,
+      );
+      written += 1;
+    }
+
+    return written;
+  }
+
+  private sortClustersBackToFront(
+    activeClusters: ReadonlyArray<SplatMeshSelection['activeClusters'][number]>,
+    tileBinning: SplatClusterTileBinningSnapshot,
+  ): ReadonlyArray<SplatMeshSelection['activeClusters'][number]> {
+    const orderedClusters = [...activeClusters];
+
+    orderedClusters.sort((left, right) => {
+      const leftProjection = tileBinning.clusterProjections.get(left.clusterId);
+      const rightProjection = tileBinning.clusterProjections.get(right.clusterId);
+      const leftDepth = leftProjection?.projectedDepth ?? -1;
+      const rightDepth = rightProjection?.projectedDepth ?? -1;
+
+      if (Math.abs(rightDepth - leftDepth) > 1e-4) {
+        return rightDepth - leftDepth;
+      }
+
+      const leftRadius = leftProjection?.screenRadius ?? 0;
+      const rightRadius = rightProjection?.screenRadius ?? 0;
+
+      if (Math.abs(rightRadius - leftRadius) > 0.25) {
+        return rightRadius - leftRadius;
+      }
+
+      return left.clusterId - right.clusterId;
+    });
+
+    return orderedClusters;
+  }
+
+  private resolveCameraOrderingSignature(camera: Camera): string {
+    camera.getWorldDirection(this.computeForward);
+    const position = camera.position;
+    return [
+      Math.round(position.x * 20),
+      Math.round(position.y * 20),
+      Math.round(position.z * 20),
+      Math.round(this.computeForward.x * 200),
+      Math.round(this.computeForward.y * 200),
+      Math.round(this.computeForward.z * 200),
+    ].join(',');
+  }
+
+  private shouldDepthSortCluster(
+    cluster: ReturnType<SplatMesh['getAsset']>['clusters'][number],
+    projectedCluster: SplatProjectedCluster | null,
+    samplingStride: number,
+  ): boolean {
+    if (samplingStride > 2) {
+      return false;
+    }
+
+    if (!projectedCluster) {
+      return cluster.childIds.length === 0;
+    }
+
+    const isLeafCluster = cluster.childIds.length === 0;
+    const representedRatio = cluster.representedSplatCount / Math.max(1, cluster.splatCount);
+    const isNearLeafProxy = representedRatio <= 1.15;
+    const projectedRadius = projectedCluster.screenRadius;
+    return projectedRadius >= 14 || (projectedRadius >= 8 && (isLeafCluster || isNearLeafProxy));
+  }
+
+  private getDepthSortedPageIndices(
+    page: ReturnType<SplatMesh['getAsset']>['pages'][number],
+    camera: Camera,
+  ): Uint32Array {
+    let indexBuffer = this.depthSortIndexCache.get(page.id);
+
+    if (!indexBuffer || indexBuffer.length !== page.splatCount) {
+      indexBuffer = new Uint32Array(page.splatCount);
+      this.depthSortIndexCache.set(page.id, indexBuffer);
+    }
+
+    let depthBuffer = this.depthSortValueCache.get(page.id);
+
+    if (!depthBuffer || depthBuffer.length !== page.splatCount) {
+      depthBuffer = new Float32Array(page.splatCount);
+      this.depthSortValueCache.set(page.id, depthBuffer);
+    }
+
+    this.depthSortModelView.copy(camera.matrixWorldInverse).multiply(this.owner.matrixWorld);
+    const elements = this.depthSortModelView.elements;
+
+    for (let splatIndex = 0; splatIndex < page.splatCount; splatIndex += 1) {
+      const offset = splatIndex * 3;
+      const x = page.positions[offset + 0]!;
+      const y = page.positions[offset + 1]!;
+      const z = page.positions[offset + 2]!;
+      indexBuffer[splatIndex] = splatIndex;
+      depthBuffer[splatIndex] = -(elements[2]! * x + elements[6]! * y + elements[10]! * z + elements[14]!);
+    }
+
+    indexBuffer.sort((leftIndex, rightIndex) => depthBuffer[rightIndex]! - depthBuffer[leftIndex]!);
+    return indexBuffer;
+  }
+
   private resolveCapacity(
     currentCapacity: number,
     requiredCapacity: number,
@@ -1781,7 +1983,10 @@ export class SplatSpriteCompositor {
     densityCompensation = 1,
   ): number {
     const representationGap = cluster.representedSplatCount / Math.max(1, cluster.splatCount);
-    return Math.min(1.85, (1 + Math.log2(Math.max(1, representationGap)) * 0.05) * densityCompensation);
+    const proxyBias = cluster.childIds.length === 0
+      ? 1
+      : 1 + Math.min(0.9, Math.log2(Math.max(1, representationGap)) * 0.16);
+    return Math.min(2.75, (1 + Math.log2(Math.max(1, representationGap)) * 0.08) * densityCompensation * proxyBias);
   }
 
   private resolveDensityCompensation(samplingStride: number): number {
