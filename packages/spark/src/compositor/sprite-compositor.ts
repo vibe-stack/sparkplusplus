@@ -2,21 +2,28 @@ import {
   Color,
   DoubleSide,
   DynamicDrawUsage,
-  Vector3,
   InstancedBufferAttribute,
   NormalBlending,
   Sprite,
+  Vector3,
 } from 'three';
 import { SpriteNodeMaterial } from 'three/webgpu';
 import {
+  atan,
+  cross,
   exp,
   instancedBufferAttribute,
-  lengthSq,
+  max,
+  modelViewMatrix,
   smoothstep,
+  sqrt,
   uv,
   vec2,
+  vec3,
+  vec4,
 } from 'three/tsl';
 import type { Camera } from 'three';
+import { lengthSq } from 'three/tsl';
 import { SPLAT_SEMANTIC_FLAGS } from '../core/semantics';
 import type { SplatBudgetOptions } from '../core/budgets';
 import type { SplatMeshSelection } from '../scheduler/bootstrap-scheduler';
@@ -56,8 +63,8 @@ const EMPTY_SNAPSHOT: SplatCompositorSnapshot = {
 
 interface PreparedPageCache {
   materialVersion: number;
-  positions: Float32Array;
   baseScales: Float32Array;
+  rotations: Float32Array;
   colors: Float32Array;
   opacities: Float32Array;
 }
@@ -69,11 +76,13 @@ export class SplatSpriteCompositor {
   private material?: SpriteNodeMaterial;
   private positionAttribute?: InstancedBufferAttribute;
   private scaleAttribute?: InstancedBufferAttribute;
+  private rotationAttribute?: InstancedBufferAttribute;
   private colorAttribute?: InstancedBufferAttribute;
   private opacityAttribute?: InstancedBufferAttribute;
 
   private positionArray = new Float32Array(0);
   private scaleArray = new Float32Array(0);
+  private rotationArray = new Float32Array(0);
   private colorArray = new Float32Array(0);
   private opacityArray = new Float32Array(0);
 
@@ -139,14 +148,11 @@ export class SplatSpriteCompositor {
 
       if (preparedPage) {
         this.copyPreparedPage(
-          preparedPage.positions,
+          page.positions,
           preparedPage.baseScales,
+          preparedPage.rotations,
           preparedPage.colors,
           preparedPage.opacities,
-          this.positionArray,
-          this.scaleArray,
-          this.colorArray,
-          this.opacityArray,
           instanceCount,
           coverageScaleBoost,
         );
@@ -159,7 +165,7 @@ export class SplatSpriteCompositor {
 
       for (let splatIndex = 0; splatIndex < page.splatCount; splatIndex += 1) {
         const sourceOffset = splatIndex * 3;
-        const baseScale = this.resolveBaseSplatScale(page.scales, sourceOffset) * coverageScaleBoost;
+        const rotationOffset = splatIndex * 4;
 
         this.colorScratch.setRGB(
           page.colors[sourceOffset + 0]!,
@@ -193,8 +199,13 @@ export class SplatSpriteCompositor {
           page.positions[sourceOffset + 0]!,
           page.positions[sourceOffset + 1]!,
           page.positions[sourceOffset + 2]!,
-          baseScale * resolvedEffects.pointSizeMultiplier,
-          baseScale * resolvedEffects.pointSizeMultiplier,
+          this.resolveBaseScale(page.scales[sourceOffset + 0]!, coverageScaleBoost * resolvedEffects.pointSizeMultiplier),
+          this.resolveBaseScale(page.scales[sourceOffset + 1]!, coverageScaleBoost * resolvedEffects.pointSizeMultiplier),
+          this.resolveBaseScale(page.scales[sourceOffset + 2]!, coverageScaleBoost * resolvedEffects.pointSizeMultiplier),
+          page.rotations[rotationOffset + 0]!,
+          page.rotations[rotationOffset + 1]!,
+          page.rotations[rotationOffset + 2]!,
+          page.rotations[rotationOffset + 3]!,
           this.colorScratch,
           Math.min(
             1,
@@ -231,7 +242,8 @@ export class SplatSpriteCompositor {
     );
 
     this.positionArray = new Float32Array(nextCapacity * 3);
-    this.scaleArray = new Float32Array(nextCapacity * 2);
+    this.scaleArray = new Float32Array(nextCapacity * 3);
+    this.rotationArray = new Float32Array(nextCapacity * 4);
     this.colorArray = new Float32Array(nextCapacity * 3);
     this.opacityArray = new Float32Array(nextCapacity);
     this.rebuildSprite();
@@ -243,12 +255,14 @@ export class SplatSpriteCompositor {
     }
 
     this.positionAttribute = this.createAttribute(this.positionArray, 3);
-    this.scaleAttribute = this.createAttribute(this.scaleArray, 2);
+    this.scaleAttribute = this.createAttribute(this.scaleArray, 3);
+    this.rotationAttribute = this.createAttribute(this.rotationArray, 4);
     this.colorAttribute = this.createAttribute(this.colorArray, 3);
     this.opacityAttribute = this.createAttribute(this.opacityArray, 1);
     this.material = this.createMaterial(
       this.positionAttribute,
       this.scaleAttribute,
+      this.rotationAttribute,
       this.colorAttribute,
       this.opacityAttribute,
     );
@@ -263,6 +277,7 @@ export class SplatSpriteCompositor {
   private createMaterial(
     positionAttribute: InstancedBufferAttribute,
     scaleAttribute: InstancedBufferAttribute,
+    rotationAttribute: InstancedBufferAttribute,
     colorAttribute: InstancedBufferAttribute,
     opacityAttribute: InstancedBufferAttribute,
   ): SpriteNodeMaterial {
@@ -273,9 +288,29 @@ export class SplatSpriteCompositor {
     const feather = smoothstep(1.0, 0.5, radial);
     const gaussian = exp(radial.mul(-10.5));
     const alphaNode = instancedBufferAttribute(opacityAttribute).mul(gaussian).mul(feather);
+    const scaleNode = instancedBufferAttribute(scaleAttribute);
+    const rotationNode = instancedBufferAttribute(rotationAttribute);
+    const quaternionXYZ = rotationNode.xyz;
+    const quaternionW = rotationNode.w;
+    const rotateAxis = (axisNode: any) => {
+      const doubleCross = cross(quaternionXYZ, axisNode).mul(2);
+      return axisNode.add(doubleCross.mul(quaternionW)).add(cross(quaternionXYZ, doubleCross));
+    };
+    const axisXView = modelViewMatrix.mul(vec4(rotateAxis(vec3(scaleNode.x, 0, 0)), 0)).xyz;
+    const axisYView = modelViewMatrix.mul(vec4(rotateAxis(vec3(0, scaleNode.y, 0)), 0)).xyz;
+    const axisZView = modelViewMatrix.mul(vec4(rotateAxis(vec3(0, 0, scaleNode.z)), 0)).xyz;
+    const covarianceXX = axisXView.x.mul(axisXView.x).add(axisYView.x.mul(axisYView.x)).add(axisZView.x.mul(axisZView.x));
+    const covarianceXY = axisXView.x.mul(axisXView.y).add(axisYView.x.mul(axisYView.y)).add(axisZView.x.mul(axisZView.y));
+    const covarianceYY = axisXView.y.mul(axisXView.y).add(axisYView.y.mul(axisYView.y)).add(axisZView.y.mul(axisZView.y));
+    const trace = covarianceXX.add(covarianceYY);
+    const delta = sqrt(max(0.000001, covarianceXX.sub(covarianceYY).mul(covarianceXX.sub(covarianceYY)).add(covarianceXY.mul(covarianceXY).mul(4))));
+    const majorScale = sqrt(max(0.000016, trace.add(delta).mul(0.5)));
+    const minorScale = sqrt(max(0.000004, trace.sub(delta).mul(0.5)));
+    const ellipseRotation = atan(covarianceXY.mul(2), covarianceXX.sub(covarianceYY)).mul(0.5);
 
     material.positionNode = instancedBufferAttribute(positionAttribute);
-    material.scaleNode = instancedBufferAttribute(scaleAttribute);
+    material.scaleNode = vec2(majorScale, minorScale);
+    material.rotationNode = ellipseRotation;
     material.colorNode = instancedBufferAttribute(colorAttribute).mul(alphaNode);
     material.opacityNode = alphaNode;
     material.maskNode = radial.lessThan(1.0);
@@ -297,7 +332,8 @@ export class SplatSpriteCompositor {
 
   private flushAttributes(instanceCount: number): void {
     this.updateAttribute(this.positionAttribute, instanceCount, 3);
-    this.updateAttribute(this.scaleAttribute, instanceCount, 2);
+    this.updateAttribute(this.scaleAttribute, instanceCount, 3);
+    this.updateAttribute(this.rotationAttribute, instanceCount, 4);
     this.updateAttribute(this.colorAttribute, instanceCount, 3);
     this.updateAttribute(this.opacityAttribute, instanceCount, 1);
   }
@@ -332,16 +368,27 @@ export class SplatSpriteCompositor {
     z: number,
     scaleX: number,
     scaleY: number,
+    scaleZ: number,
+    rotationX: number,
+    rotationY: number,
+    rotationZ: number,
+    rotationW: number,
     color: Color,
     opacity: number,
   ): void {
     const positionOffset = index * 3;
-    const scaleOffset = index * 2;
+    const scaleOffset = index * 3;
+    const rotationOffset = index * 4;
     this.positionArray[positionOffset + 0] = x;
     this.positionArray[positionOffset + 1] = y;
     this.positionArray[positionOffset + 2] = z;
     this.scaleArray[scaleOffset + 0] = scaleX;
     this.scaleArray[scaleOffset + 1] = scaleY;
+    this.scaleArray[scaleOffset + 2] = scaleZ;
+    this.rotationArray[rotationOffset + 0] = rotationX;
+    this.rotationArray[rotationOffset + 1] = rotationY;
+    this.rotationArray[rotationOffset + 2] = rotationZ;
+    this.rotationArray[rotationOffset + 3] = rotationW;
     this.colorArray[positionOffset + 0] = color.r;
     this.colorArray[positionOffset + 1] = color.g;
     this.colorArray[positionOffset + 2] = color.b;
@@ -362,21 +409,19 @@ export class SplatSpriteCompositor {
       return cached;
     }
 
-    const baseScales = new Float32Array(page.splatCount * 2);
+    const baseScales = new Float32Array(page.splatCount * 3);
+    const rotations = new Float32Array(page.rotations);
     const colors = new Float32Array(page.splatCount * 3);
     const opacities = new Float32Array(page.splatCount);
     const tint = this.owner.splatMaterial.tint;
     const colorGain = this.owner.splatMaterial.colorGain;
-    const pointSize = this.owner.splatMaterial.pointSize;
     const opacity = this.owner.splatMaterial.opacity;
 
     for (let splatIndex = 0; splatIndex < page.splatCount; splatIndex += 1) {
       const sourceOffset = splatIndex * 3;
-      const scaleOffset = splatIndex * 2;
-      const scale = this.resolveBaseSplatScale(page.scales, sourceOffset, pointSize);
-
-      baseScales[scaleOffset + 0] = scale;
-      baseScales[scaleOffset + 1] = scale;
+      baseScales[sourceOffset + 0] = this.resolveBaseScale(page.scales[sourceOffset + 0]!);
+      baseScales[sourceOffset + 1] = this.resolveBaseScale(page.scales[sourceOffset + 1]!);
+      baseScales[sourceOffset + 2] = this.resolveBaseScale(page.scales[sourceOffset + 2]!);
       colors[sourceOffset + 0] = page.colors[sourceOffset + 0]! * tint.r * colorGain;
       colors[sourceOffset + 1] = page.colors[sourceOffset + 1]! * tint.g * colorGain;
       colors[sourceOffset + 2] = page.colors[sourceOffset + 2]! * tint.b * colorGain;
@@ -385,8 +430,8 @@ export class SplatSpriteCompositor {
 
     const preparedPage: PreparedPageCache = {
       materialVersion,
-      positions: page.positions,
       baseScales,
+      rotations,
       colors,
       opacities,
     };
@@ -398,28 +443,26 @@ export class SplatSpriteCompositor {
   private copyPreparedPage(
     sourcePositions: Float32Array,
     sourceScales: Float32Array,
+    sourceRotations: Float32Array,
     sourceColors: Float32Array,
     sourceOpacities: Float32Array,
-    targetPositions: Float32Array,
-    targetScales: Float32Array,
-    targetColors: Float32Array,
-    targetOpacities: Float32Array,
     targetInstanceOffset: number,
     scaleMultiplier: number,
   ): void {
-    targetPositions.set(sourcePositions, targetInstanceOffset * 3);
-    targetColors.set(sourceColors, targetInstanceOffset * 3);
-    targetOpacities.set(sourceOpacities, targetInstanceOffset);
+    this.positionArray.set(sourcePositions, targetInstanceOffset * 3);
+    this.rotationArray.set(sourceRotations, targetInstanceOffset * 4);
+    this.colorArray.set(sourceColors, targetInstanceOffset * 3);
+    this.opacityArray.set(sourceOpacities, targetInstanceOffset);
+
+    const targetScaleOffset = targetInstanceOffset * 3;
 
     if (Math.abs(scaleMultiplier - 1) <= 1e-4) {
-      targetScales.set(sourceScales, targetInstanceOffset * 2);
+      this.scaleArray.set(sourceScales, targetScaleOffset);
       return;
     }
 
-    const targetScaleOffset = targetInstanceOffset * 2;
-
     for (let index = 0; index < sourceScales.length; index += 1) {
-      targetScales[targetScaleOffset + index] = sourceScales[index]! * scaleMultiplier;
+      this.scaleArray[targetScaleOffset + index] = sourceScales[index]! * scaleMultiplier;
     }
   }
 
@@ -443,20 +486,14 @@ export class SplatSpriteCompositor {
     cluster: ReturnType<SplatMesh['getAsset']>['clusters'][number],
   ): number {
     const representationGap = cluster.representedSplatCount / Math.max(1, cluster.splatCount);
-    return Math.min(1.7, 1 + Math.log2(Math.max(1, representationGap)) * 0.12);
+    return Math.min(1.35, 1 + Math.log2(Math.max(1, representationGap)) * 0.05);
   }
 
-  private resolveBaseSplatScale(
-    scales: Float32Array,
-    sourceOffset: number,
-    pointSize = this.owner.splatMaterial.pointSize,
+  private resolveBaseScale(
+    scale: number,
+    multiplier = 1,
   ): number {
-    const isotropicScale = Math.max(
-      scales[sourceOffset + 0]!,
-      scales[sourceOffset + 1]!,
-      scales[sourceOffset + 2]!,
-    );
-    return Math.max(0.012, isotropicScale * pointSize * 0.64);
+    return Math.max(0.012, scale * this.owner.splatMaterial.pointSize * 0.64 * multiplier);
   }
 
   private getClusterCameraDepth(

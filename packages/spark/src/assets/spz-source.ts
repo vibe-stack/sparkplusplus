@@ -22,6 +22,7 @@ export interface SpzImportOptions {
 interface PointCloud {
   positions: Float32Array;
   scales: Float32Array;
+  rotations: Float32Array;
   colors: Float32Array;
   opacities: Float32Array;
   boundsMin: SplatVec3;
@@ -126,6 +127,7 @@ function samplePointCloud(view: DataView, header: SpzHeader, maxPoints: number):
   const sampledCount = Math.ceil(header.pointCount / stride);
   const positions = new Float32Array(sampledCount * 3);
   const scales = new Float32Array(sampledCount * 3);
+  const rotations = new Float32Array(sampledCount * 4);
   const colors = new Float32Array(sampledCount * 3);
   const opacities = new Float32Array(sampledCount);
   const positionScale = 1 / (1 << header.fractionalBits);
@@ -162,7 +164,9 @@ function samplePointCloud(view: DataView, header: SpzHeader, maxPoints: number):
     const alphaByteOffset = alphasOffset + pointIndex;
     const colorByteOffset = colorsOffset + pointIndex * 3;
     const scaleByteOffset = scalesOffset + pointIndex * 3;
+    const rotationByteOffset = rotationsOffset + pointIndex * rotationStride;
     const targetOffset = sampledIndex * 3;
+    const targetRotationOffset = sampledIndex * 4;
 
     for (let axis = 0; axis < 3; axis += 1) {
       const quantized = readSigned24(view, positionByteOffset + axis * 3);
@@ -180,12 +184,21 @@ function samplePointCloud(view: DataView, header: SpzHeader, maxPoints: number):
       scales[targetOffset + axis] = Math.exp(logScale);
     }
 
+    decodeRotationQuaternion(
+      view,
+      header.version,
+      rotationByteOffset,
+      rotations,
+      targetRotationOffset,
+    );
+
     sampledIndex += 1;
   }
 
   return {
     positions,
     scales,
+    rotations,
     colors,
     opacities,
     boundsMin,
@@ -199,6 +212,35 @@ function readSigned24(view: DataView, byteOffset: number): number {
     | (view.getUint8(byteOffset + 2) << 16);
 
   return (value & 0x800000) !== 0 ? value | ~0xffffff : value;
+}
+
+function decodeRotationQuaternion(
+  view: DataView,
+  version: number,
+  byteOffset: number,
+  target: Float32Array,
+  targetOffset: number,
+): void {
+  const x = view.getUint8(byteOffset + 0) / 127.5 - 1;
+  const y = view.getUint8(byteOffset + 1) / 127.5 - 1;
+  const z = view.getUint8(byteOffset + 2) / 127.5 - 1;
+  const w = version >= 3
+    ? view.getUint8(byteOffset + 3) / 127.5 - 1
+    : Math.sqrt(Math.max(0, 1 - x * x - y * y - z * z));
+  const length = Math.hypot(x, y, z, w);
+
+  if (length <= 1e-5) {
+    target[targetOffset + 0] = 0;
+    target[targetOffset + 1] = 0;
+    target[targetOffset + 2] = 0;
+    target[targetOffset + 3] = 1;
+    return;
+  }
+
+  target[targetOffset + 0] = x / length;
+  target[targetOffset + 1] = y / length;
+  target[targetOffset + 2] = z / length;
+  target[targetOffset + 3] = w / length;
 }
 
 function buildPagedAssetFromPointCloud(
@@ -237,10 +279,9 @@ function buildPagedAssetFromPointCloud(
     parentId: number | null,
   ): BuildNodeResult => {
     const count = end - start;
-    // Internal (non-leaf) nodes only need a small coverage proxy page — their
-    // job is to provide fallback splats while leaf pages stream in, not to
-    // consume the active-page visual budget with sparse 4096-point samples
-    // spread over a huge volume.  Leaf nodes get the full page capacity.
+    // Internal (non-leaf) nodes act as coverage proxies while leaf pages
+    // stream in. Keep them bounded so they stay cheap; proxy quality is driven
+    // by aggregated representative splats rather than by brute-force count.
     const isLeaf = count <= options.minLeafPoints;
     const effectiveCapacity = isLeaf
       ? options.pageCapacity
@@ -378,6 +419,7 @@ function createPageFromRange(
   const sampleCount = Math.min(pageCapacity, sourceCount);
   const positions = new Float32Array(sampleCount * 3);
   const scales = new Float32Array(sampleCount * 3);
+  const rotations = new Float32Array(sampleCount * 4);
   const colors = new Float32Array(sampleCount * 3);
   const opacities = new Float32Array(sampleCount);
   const boundsMin: SplatVec3 = [
@@ -390,19 +432,122 @@ function createPageFromRange(
     Number.NEGATIVE_INFINITY,
     Number.NEGATIVE_INFINITY,
   ];
-  let previousSourceOffset = start - 1;
+  const isAggregatedProxy = sourceCount > sampleCount;
 
   for (let sampleIndex = 0; sampleIndex < sampleCount; sampleIndex += 1) {
-    const sourceOffset = resolveSourceOffset(
-      start,
-      sourceCount,
-      sampleIndex,
-      sampleCount,
-      previousSourceOffset,
-    );
-    const pointIndex = sortedIndices[sourceOffset]!;
     const targetOffset = sampleIndex * 3;
+
+    if (isAggregatedProxy) {
+      const bucketStart = start + Math.floor((sourceCount * sampleIndex) / sampleCount);
+      const bucketEnd = Math.max(
+        bucketStart + 1,
+        start + Math.floor((sourceCount * (sampleIndex + 1)) / sampleCount),
+      );
+      const bucketBoundsMin: SplatVec3 = [
+        Number.POSITIVE_INFINITY,
+        Number.POSITIVE_INFINITY,
+        Number.POSITIVE_INFINITY,
+      ];
+      const bucketBoundsMax: SplatVec3 = [
+        Number.NEGATIVE_INFINITY,
+        Number.NEGATIVE_INFINITY,
+        Number.NEGATIVE_INFINITY,
+      ];
+      let weightSum = 0;
+      let opacityMass = 0;
+      let colorR = 0;
+      let colorG = 0;
+      let colorB = 0;
+      let positionX = 0;
+      let positionY = 0;
+      let positionZ = 0;
+      let scaleX = 0;
+      let scaleY = 0;
+      let scaleZ = 0;
+      let rotationX = 0;
+      let rotationY = 0;
+      let rotationZ = 0;
+      let rotationW = 0;
+
+      for (let sourceOffset = bucketStart; sourceOffset < bucketEnd; sourceOffset += 1) {
+        const pointIndex = sortedIndices[sourceOffset]!;
+        const inputOffset = pointIndex * 3;
+        const inputRotationOffset = pointIndex * 4;
+        const opacity = pointCloud.opacities[pointIndex]!;
+        const pointScaleX = pointCloud.scales[inputOffset + 0]!;
+        const pointScaleY = pointCloud.scales[inputOffset + 1]!;
+        const pointScaleZ = pointCloud.scales[inputOffset + 2]!;
+        const weight = Math.max(0.05, opacity);
+        const position0 = pointCloud.positions[inputOffset + 0]!;
+        const position1 = pointCloud.positions[inputOffset + 1]!;
+        const position2 = pointCloud.positions[inputOffset + 2]!;
+
+        weightSum += weight;
+        opacityMass += opacity;
+        positionX += position0 * weight;
+        positionY += position1 * weight;
+        positionZ += position2 * weight;
+        scaleX += pointScaleX * weight;
+        scaleY += pointScaleY * weight;
+        scaleZ += pointScaleZ * weight;
+        rotationX += pointCloud.rotations[inputRotationOffset + 0]! * weight;
+        rotationY += pointCloud.rotations[inputRotationOffset + 1]! * weight;
+        rotationZ += pointCloud.rotations[inputRotationOffset + 2]! * weight;
+        rotationW += pointCloud.rotations[inputRotationOffset + 3]! * weight;
+        colorR += pointCloud.colors[inputOffset + 0]! * weight;
+        colorG += pointCloud.colors[inputOffset + 1]! * weight;
+        colorB += pointCloud.colors[inputOffset + 2]! * weight;
+
+        bucketBoundsMin[0] = Math.min(bucketBoundsMin[0], position0);
+        bucketBoundsMin[1] = Math.min(bucketBoundsMin[1], position1);
+        bucketBoundsMin[2] = Math.min(bucketBoundsMin[2], position2);
+        bucketBoundsMax[0] = Math.max(bucketBoundsMax[0], position0);
+        bucketBoundsMax[1] = Math.max(bucketBoundsMax[1], position1);
+        bucketBoundsMax[2] = Math.max(bucketBoundsMax[2], position2);
+      }
+
+      const bucketCount = Math.max(1, bucketEnd - bucketStart);
+      const normalizedWeight = Math.max(1e-5, weightSum);
+      const averageOpacity = opacityMass / bucketCount;
+      const averageScaleX = scaleX / normalizedWeight;
+      const averageScaleY = scaleY / normalizedWeight;
+      const averageScaleZ = scaleZ / normalizedWeight;
+      const averageScale = (averageScaleX + averageScaleY + averageScaleZ) / 3;
+      const extentScaleX = (bucketBoundsMax[0] - bucketBoundsMin[0]) * 0.12;
+      const extentScaleY = (bucketBoundsMax[1] - bucketBoundsMin[1]) * 0.12;
+      const extentScaleZ = (bucketBoundsMax[2] - bucketBoundsMin[2]) * 0.12;
+      const proxyScaleCap = Math.max(0.01, averageScale * 2.2);
+
+      positions[targetOffset + 0] = positionX / normalizedWeight;
+      positions[targetOffset + 1] = positionY / normalizedWeight;
+      positions[targetOffset + 2] = positionZ / normalizedWeight;
+      scales[targetOffset + 0] = Math.min(proxyScaleCap, Math.max(averageScaleX * 1.1, extentScaleX));
+      scales[targetOffset + 1] = Math.min(proxyScaleCap, Math.max(averageScaleY * 1.1, extentScaleY));
+      scales[targetOffset + 2] = Math.min(proxyScaleCap, Math.max(averageScaleZ * 1.1, extentScaleZ));
+      writeNormalizedQuaternion(
+        rotations,
+        sampleIndex * 4,
+        rotationX,
+        rotationY,
+        rotationZ,
+        rotationW,
+      );
+      colors[targetOffset + 0] = colorR / normalizedWeight;
+      colors[targetOffset + 1] = colorG / normalizedWeight;
+      colors[targetOffset + 2] = colorB / normalizedWeight;
+      opacities[sampleIndex] = Math.max(0.06, Math.min(0.42, averageOpacity * 0.5));
+
+      for (let axis = 0; axis < 3; axis += 1) {
+        boundsMin[axis] = Math.min(boundsMin[axis]!, bucketBoundsMin[axis]!);
+        boundsMax[axis] = Math.max(boundsMax[axis]!, bucketBoundsMax[axis]!);
+      }
+
+      continue;
+    }
+
+    const pointIndex = sortedIndices[start + sampleIndex]!;
     const inputOffset = pointIndex * 3;
+    const inputRotationOffset = pointIndex * 4;
 
     for (let axis = 0; axis < 3; axis += 1) {
       const position = pointCloud.positions[inputOffset + axis]!;
@@ -414,7 +559,7 @@ function createPageFromRange(
     }
 
     opacities[sampleIndex] = pointCloud.opacities[pointIndex]!;
-    previousSourceOffset = sourceOffset;
+    rotations.set(pointCloud.rotations.subarray(inputRotationOffset, inputRotationOffset + 4), sampleIndex * 4);
   }
 
   return {
@@ -424,9 +569,10 @@ function createPageFromRange(
     splatCount: sampleCount,
     capacity: pageCapacity,
     semanticMask: 0,
-    byteSize: positions.byteLength + scales.byteLength + colors.byteLength + opacities.byteLength,
+    byteSize: positions.byteLength + scales.byteLength + rotations.byteLength + colors.byteLength + opacities.byteLength,
     positions,
     scales,
+    rotations,
     colors,
     opacities,
     boundsMin,
@@ -477,32 +623,28 @@ function finalizeClusterFromBounds(
   cluster.expectedOverdrawScore = Math.max(1, Math.sqrt(representedPoints) * averageScale * 18);
 }
 
-function resolveSourceOffset(
-  start: number,
-  sourceCount: number,
-  sampleIndex: number,
-  sampleCount: number,
-  previousSourceOffset: number,
-): number {
-  const samplePosition = (sampleIndex + 0.2 + radicalInverseBase2(sampleIndex + 1) * 0.6) / sampleCount;
-  const maxSourceOffset = start + sourceCount - 1;
-  let sourceOffset = start + Math.min(sourceCount - 1, Math.floor(samplePosition * sourceCount));
+function writeNormalizedQuaternion(
+  target: Float32Array,
+  targetOffset: number,
+  x: number,
+  y: number,
+  z: number,
+  w: number,
+): void {
+  const length = Math.hypot(x, y, z, w);
 
-  if (sourceOffset <= previousSourceOffset) {
-    sourceOffset = Math.min(maxSourceOffset, previousSourceOffset + 1);
+  if (length <= 1e-5) {
+    target[targetOffset + 0] = 0;
+    target[targetOffset + 1] = 0;
+    target[targetOffset + 2] = 0;
+    target[targetOffset + 3] = 1;
+    return;
   }
 
-  return sourceOffset;
-}
-
-function radicalInverseBase2(value: number): number {
-  let bits = value >>> 0;
-  bits = ((bits << 16) | (bits >>> 16)) >>> 0;
-  bits = (((bits & 0x55555555) << 1) | ((bits & 0xaaaaaaaa) >>> 1)) >>> 0;
-  bits = (((bits & 0x33333333) << 2) | ((bits & 0xcccccccc) >>> 2)) >>> 0;
-  bits = (((bits & 0x0f0f0f0f) << 4) | ((bits & 0xf0f0f0f0) >>> 4)) >>> 0;
-  bits = (((bits & 0x00ff00ff) << 8) | ((bits & 0xff00ff00) >>> 8)) >>> 0;
-  return bits * 2.3283064365386963e-10;
+  target[targetOffset + 0] = x / length;
+  target[targetOffset + 1] = y / length;
+  target[targetOffset + 2] = z / length;
+  target[targetOffset + 3] = w / length;
 }
 
 function srgbChannelToLinear(value: number): number {

@@ -246,6 +246,7 @@ export class ProceduralSplatSource implements SplatSource {
     );
     const positions = new Float32Array(splatCount * 3);
     const scales = new Float32Array(splatCount * 3);
+    const rotations = new Float32Array(splatCount * 4);
     const colors = new Float32Array(splatCount * 3);
     const opacities = new Float32Array(splatCount);
     const tint = new Color();
@@ -266,6 +267,7 @@ export class ProceduralSplatSource implements SplatSource {
       scales[offset + 0] = scale;
       scales[offset + 1] = scale * random.range(0.8, 1.4);
       scales[offset + 2] = scale * random.range(0.8, 1.4);
+      rotations[i * 4 + 3] = 1;
 
       tint.copy(colorA).lerp(colorB, MathUtils.clamp(levelAlpha * 0.55 + random.range(0.1, 0.5), 0, 1));
 
@@ -290,9 +292,10 @@ export class ProceduralSplatSource implements SplatSource {
       splatCount,
       capacity,
       semanticMask,
-      byteSize: positions.byteLength + scales.byteLength + colors.byteLength + opacities.byteLength,
+      byteSize: positions.byteLength + scales.byteLength + rotations.byteLength + colors.byteLength + opacities.byteLength,
       positions,
       scales,
+      rotations,
       colors,
       opacities,
     };

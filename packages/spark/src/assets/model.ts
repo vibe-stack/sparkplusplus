@@ -16,6 +16,7 @@ export interface SplatPage {
   byteSize: number;
   positions: Float32Array;
   scales: Float32Array;
+  rotations: Float32Array;
   colors: Float32Array;
   opacities: Float32Array;
 }
