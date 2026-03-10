@@ -91,7 +91,10 @@ function parseSpzBuffer(buffer: ArrayBuffer, options: SpzImportOptions): {
   const pointCloud = samplePointCloud(view, header, options.maxPoints ?? header.pointCount);
   const pageCapacity = Math.max(256, options.pageCapacity ?? 1_024);
   const branching = Math.max(2, Math.min(8, options.branching ?? 4));
-  const minLeafPoints = Math.max(pageCapacity, options.minLeafPoints ?? pageCapacity);
+  const minLeafPoints = Math.max(
+    256,
+    Math.min(pageCapacity, options.minLeafPoints ?? Math.max(512, Math.round(pageCapacity * 0.5))),
+  );
   const asset = buildPagedAssetFromPointCloud(pointCloud, {
     id: `spz:${options.label ?? 'demo'}`,
     label: options.label ?? 'Demo SPZ',
@@ -169,10 +172,10 @@ function samplePointCloud(view: DataView, header: SpzHeader, maxPoints: number):
       boundsMax[axis] = Math.max(boundsMax[axis]!, position);
     }
 
-    opacities[sampledIndex] = view.getUint8(alphaByteOffset) / 255;
+    opacities[sampledIndex] = Math.pow(view.getUint8(alphaByteOffset) / 255, 0.7);
 
     for (let axis = 0; axis < 3; axis += 1) {
-      colors[targetOffset + axis] = view.getUint8(colorByteOffset + axis) / 255;
+      colors[targetOffset + axis] = srgbChannelToLinear(view.getUint8(colorByteOffset + axis) / 255);
       const logScale = view.getUint8(scaleByteOffset + axis) / 16 - 10;
       scales[targetOffset + axis] = Math.exp(logScale);
     }
@@ -239,7 +242,12 @@ function buildPagedAssetFromPointCloud(
     // consume the active-page visual budget with sparse 4096-point samples
     // spread over a huge volume.  Leaf nodes get the full page capacity.
     const isLeaf = count <= options.minLeafPoints;
-    const effectiveCapacity = isLeaf ? options.pageCapacity : Math.min(256, options.pageCapacity);
+    const effectiveCapacity = isLeaf
+      ? options.pageCapacity
+      : Math.min(
+          options.pageCapacity,
+          Math.max(1_024, Math.min(2_048, Math.ceil(Math.sqrt(count) * 4))),
+        );
     const pageId = pages.length;
     const page = createPageFromRange(
       pageId,
@@ -258,6 +266,7 @@ function buildPagedAssetFromPointCloud(
       pageId,
       level,
       splatCount: page.splatCount,
+      representedSplatCount: count,
       center: [0, 0, 0],
       radius: 0,
       boundsMin: [0, 0, 0],
@@ -381,9 +390,16 @@ function createPageFromRange(
     Number.NEGATIVE_INFINITY,
     Number.NEGATIVE_INFINITY,
   ];
+  let previousSourceOffset = start - 1;
 
   for (let sampleIndex = 0; sampleIndex < sampleCount; sampleIndex += 1) {
-    const sourceOffset = start + Math.floor((sourceCount * sampleIndex) / sampleCount);
+    const sourceOffset = resolveSourceOffset(
+      start,
+      sourceCount,
+      sampleIndex,
+      sampleCount,
+      previousSourceOffset,
+    );
     const pointIndex = sortedIndices[sourceOffset]!;
     const targetOffset = sampleIndex * 3;
     const inputOffset = pointIndex * 3;
@@ -398,6 +414,7 @@ function createPageFromRange(
     }
 
     opacities[sampleIndex] = pointCloud.opacities[pointIndex]!;
+    previousSourceOffset = sourceOffset;
   }
 
   return {
@@ -450,6 +467,7 @@ function finalizeClusterFromBounds(
 
   averageScale = probeCount === 0 ? 0.01 : averageScale / probeCount;
 
+  cluster.representedSplatCount = representedPoints;
   cluster.center = [centerX, centerY, centerZ];
   cluster.radius = radius;
   cluster.boundsMin = boundsMin;
@@ -457,6 +475,42 @@ function finalizeClusterFromBounds(
   cluster.projectedErrorCoefficient = Math.max(24, radius * Math.sqrt(representedPoints));
   cluster.anisotropySeverity = averageScale;
   cluster.expectedOverdrawScore = Math.max(1, Math.sqrt(representedPoints) * averageScale * 18);
+}
+
+function resolveSourceOffset(
+  start: number,
+  sourceCount: number,
+  sampleIndex: number,
+  sampleCount: number,
+  previousSourceOffset: number,
+): number {
+  const samplePosition = (sampleIndex + 0.2 + radicalInverseBase2(sampleIndex + 1) * 0.6) / sampleCount;
+  const maxSourceOffset = start + sourceCount - 1;
+  let sourceOffset = start + Math.min(sourceCount - 1, Math.floor(samplePosition * sourceCount));
+
+  if (sourceOffset <= previousSourceOffset) {
+    sourceOffset = Math.min(maxSourceOffset, previousSourceOffset + 1);
+  }
+
+  return sourceOffset;
+}
+
+function radicalInverseBase2(value: number): number {
+  let bits = value >>> 0;
+  bits = ((bits << 16) | (bits >>> 16)) >>> 0;
+  bits = (((bits & 0x55555555) << 1) | ((bits & 0xaaaaaaaa) >>> 1)) >>> 0;
+  bits = (((bits & 0x33333333) << 2) | ((bits & 0xcccccccc) >>> 2)) >>> 0;
+  bits = (((bits & 0x0f0f0f0f) << 4) | ((bits & 0xf0f0f0f0) >>> 4)) >>> 0;
+  bits = (((bits & 0x00ff00ff) << 8) | ((bits & 0xff00ff00) >>> 8)) >>> 0;
+  return bits * 2.3283064365386963e-10;
+}
+
+function srgbChannelToLinear(value: number): number {
+  if (value <= 0.04045) {
+    return value / 12.92;
+  }
+
+  return Math.pow((value + 0.055) / 1.055, 2.4);
 }
 
 function mortonCodeForPoint(

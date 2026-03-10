@@ -112,6 +112,7 @@ export class ProceduralSplatSource implements SplatSource {
         pageId,
         level,
         splatCount: page.splatCount,
+        representedSplatCount: page.splatCount,
         center: clusterCenter,
         radius,
         boundsMin: [...clusterCenter],

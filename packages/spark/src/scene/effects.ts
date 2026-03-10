@@ -33,6 +33,10 @@ export class SplatEffectStack {
     return this;
   }
 
+  isIdentity(): boolean {
+    return this.effects.every((effect) => effect.enabled === false);
+  }
+
   evaluate(semanticMask: number, timeSeconds: number): SplatResolvedEffects {
     const tint = new Color(1, 1, 1);
     let opacityMultiplier = 1;

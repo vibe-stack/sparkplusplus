@@ -54,9 +54,18 @@ const EMPTY_SNAPSHOT: SplatCompositorSnapshot = {
   maxTileComplexity: 0,
 };
 
+interface PreparedPageCache {
+  materialVersion: number;
+  positions: Float32Array;
+  baseScales: Float32Array;
+  colors: Float32Array;
+  opacities: Float32Array;
+}
+
 export class SplatSpriteCompositor {
   private readonly tileClassifier = new SplatTileClassifier();
   private readonly depthSliceCount = 2;
+  private readonly preparedPageCache = new Map<number, PreparedPageCache>();
 
   private weightedSprite?: Sprite;
   private heroSprite?: Sprite;
@@ -109,6 +118,7 @@ export class SplatSpriteCompositor {
 
   sync(selection: SplatMeshSelection, context: SplatCompositorFrameContext): void {
     const asset = this.owner.getAsset();
+    const canUsePreparedPages = this.canUsePreparedPages();
     const tileClassification = this.tileClassifier.classify(
       this.owner,
       selection.activeClusters,
@@ -121,9 +131,6 @@ export class SplatSpriteCompositor {
     const clusterModeSignature = selection.activeClusters
       .map((cluster) => `${cluster.clusterId}:${tileClassification.clusterModes.get(cluster.clusterId) ?? 'weighted'}`)
       .join('|');
-    const hasDepthSlicedClusters = selection.activeClusters.some(
-      (cluster) => tileClassification.clusterModes.get(cluster.clusterId) === 'depth-sliced',
-    );
     // Do NOT include a camera-position bucket in the signature.  The fine-
     // grained quantisation (×4 position, ×16 direction) caused a full
     // per-splat CPU array rebuild on every sub-0.25m camera movement, making
@@ -190,52 +197,112 @@ export class SplatSpriteCompositor {
       const cluster = asset.clusters[activeCluster.clusterId]!;
       const page = asset.pages[activeCluster.pageId]!;
       const mode = tileClassification.clusterModes.get(cluster.id) ?? 'weighted';
-      const resolvedEffects = this.owner.effectStack.evaluate(cluster.semanticMask, context.timeSeconds);
-      const clusterCameraDepth = this.getCameraDepth(
-        cluster.center[0],
-        cluster.center[1],
-        cluster.center[2],
-        context.camera,
-        this.clusterCenterScratch,
-      );
-      this.effectTintScratch.copy(resolvedEffects.tint);
+      const preparedPage = canUsePreparedPages ? this.getPreparedPageCache(page) : null;
+      const coverageScaleBoost = this.resolveCoverageScaleBoost(cluster);
+
+      if (preparedPage && mode === 'hero') {
+        this.copyPreparedPage(
+          preparedPage.positions,
+          preparedPage.baseScales,
+          preparedPage.colors,
+          preparedPage.opacities,
+          this.heroPositionArray,
+          this.heroScaleArray,
+          this.heroColorArray,
+          this.heroOpacityArray,
+          heroCount,
+          coverageScaleBoost * 1.1,
+        );
+        heroCount += page.splatCount;
+        continue;
+      }
+
+      if (preparedPage && mode === 'weighted') {
+        this.copyPreparedPage(
+          preparedPage.positions,
+          preparedPage.baseScales,
+          preparedPage.colors,
+          preparedPage.opacities,
+          this.weightedPositionArray,
+          this.weightedScaleArray,
+          this.weightedColorArray,
+          this.weightedOpacityArray,
+          weightedCount,
+          coverageScaleBoost,
+        );
+        weightedCount += page.splatCount;
+        continue;
+      }
+
+      const resolvedEffects = preparedPage
+        ? null
+        : this.owner.effectStack.evaluate(cluster.semanticMask, context.timeSeconds);
+      const clusterCameraDepth = mode === 'depth-sliced'
+        ? this.getCameraDepth(
+            cluster.center[0],
+            cluster.center[1],
+            cluster.center[2],
+            context.camera,
+            this.clusterCenterScratch,
+          )
+        : 0;
+
+      if (resolvedEffects) {
+        this.effectTintScratch.copy(resolvedEffects.tint);
+      }
 
       for (let splatIndex = 0; splatIndex < page.splatCount; splatIndex += 1) {
         const sourceOffset = splatIndex * 3;
-        const baseScaleX = Math.max(0.015, page.scales[sourceOffset + 0]! * this.owner.splatMaterial.pointSize);
-        const baseScaleY = Math.max(0.015, page.scales[sourceOffset + 1]! * this.owner.splatMaterial.pointSize);
+        const scaleOffset = splatIndex * 2;
+        const isotropicBaseScale = preparedPage
+          ? preparedPage.baseScales[scaleOffset + 0]!
+          : this.resolveBaseSplatScale(page.scales, sourceOffset);
+        const baseScaleX = isotropicBaseScale * coverageScaleBoost;
+        const baseScaleY = isotropicBaseScale * coverageScaleBoost;
 
-        this.colorScratch.setRGB(
-          page.colors[sourceOffset + 0]!,
-          page.colors[sourceOffset + 1]!,
-          page.colors[sourceOffset + 2]!,
-        );
+        if (preparedPage) {
+          this.colorScratch.setRGB(
+            preparedPage.colors[sourceOffset + 0]!,
+            preparedPage.colors[sourceOffset + 1]!,
+            preparedPage.colors[sourceOffset + 2]!,
+          );
+        } else {
+          this.colorScratch.setRGB(
+            page.colors[sourceOffset + 0]!,
+            page.colors[sourceOffset + 1]!,
+            page.colors[sourceOffset + 2]!,
+          );
 
-        if (this.owner.splatMaterial.debugMode === 'lod') {
-          this.colorScratch.setHSL(Math.min(0.85, cluster.level * 0.12), 0.75, 0.55);
-        }
-
-        if (this.owner.splatMaterial.debugMode === 'semantic') {
-          if ((cluster.semanticMask & SPLAT_SEMANTIC_FLAGS.hero) !== 0) {
-            this.colorScratch.set(0xffe066);
-          } else if ((cluster.semanticMask & SPLAT_SEMANTIC_FLAGS.glass) !== 0) {
-            this.colorScratch.set(0x93c5fd);
-          } else if ((cluster.semanticMask & SPLAT_SEMANTIC_FLAGS.foliage) !== 0) {
-            this.colorScratch.set(0x86efac);
-          } else {
-            this.colorScratch.set(0xf8fafc);
+          if (this.owner.splatMaterial.debugMode === 'lod') {
+            this.colorScratch.setHSL(Math.min(0.85, cluster.level * 0.12), 0.75, 0.55);
           }
+
+          if (this.owner.splatMaterial.debugMode === 'semantic') {
+            if ((cluster.semanticMask & SPLAT_SEMANTIC_FLAGS.hero) !== 0) {
+              this.colorScratch.set(0xffe066);
+            } else if ((cluster.semanticMask & SPLAT_SEMANTIC_FLAGS.glass) !== 0) {
+              this.colorScratch.set(0x93c5fd);
+            } else if ((cluster.semanticMask & SPLAT_SEMANTIC_FLAGS.foliage) !== 0) {
+              this.colorScratch.set(0x86efac);
+            } else {
+              this.colorScratch.set(0xf8fafc);
+            }
+          }
+
+          this.colorScratch
+            .multiply(this.owner.splatMaterial.tint)
+            .multiply(this.effectTintScratch)
+            .multiplyScalar(this.owner.splatMaterial.colorGain);
         }
 
-        this.colorScratch
-          .multiply(this.owner.splatMaterial.tint)
-          .multiply(this.effectTintScratch)
-          .multiplyScalar(this.owner.splatMaterial.colorGain);
-
-        const opacity = Math.min(
-          1,
-          this.owner.splatMaterial.opacity * page.opacities[splatIndex]! * resolvedEffects.opacityMultiplier,
-        );
+        const opacity = preparedPage
+          ? preparedPage.opacities[splatIndex]!
+          : Math.min(
+              1,
+              this.owner.splatMaterial.opacity * page.opacities[splatIndex]! * resolvedEffects!.opacityMultiplier,
+            );
+        const resolvedScaleX = preparedPage ? baseScaleX : baseScaleX * resolvedEffects!.pointSizeMultiplier;
+        const resolvedScaleY = preparedPage ? baseScaleY : baseScaleY * resolvedEffects!.pointSizeMultiplier;
 
         if (mode === 'hero') {
           this.writeInstance(
@@ -247,8 +314,8 @@ export class SplatSpriteCompositor {
             page.positions[sourceOffset + 0]!,
             page.positions[sourceOffset + 1]!,
             page.positions[sourceOffset + 2]!,
-            baseScaleX * resolvedEffects.pointSizeMultiplier * 1.1,
-            baseScaleY * resolvedEffects.pointSizeMultiplier * 1.1,
+            resolvedScaleX * 1.1,
+            resolvedScaleY * 1.1,
             this.colorScratch,
             opacity,
           );
@@ -272,8 +339,8 @@ export class SplatSpriteCompositor {
               page.positions[sourceOffset + 0]!,
               page.positions[sourceOffset + 1]!,
               page.positions[sourceOffset + 2]!,
-              baseScaleX * resolvedEffects.pointSizeMultiplier,
-              baseScaleY * resolvedEffects.pointSizeMultiplier,
+              resolvedScaleX,
+              resolvedScaleY,
               this.colorScratch,
               opacity,
             );
@@ -290,8 +357,8 @@ export class SplatSpriteCompositor {
             page.positions[sourceOffset + 0]!,
             page.positions[sourceOffset + 1]!,
             page.positions[sourceOffset + 2]!,
-            baseScaleX * resolvedEffects.pointSizeMultiplier,
-            baseScaleY * resolvedEffects.pointSizeMultiplier,
+            resolvedScaleX,
+            resolvedScaleY,
             this.colorScratch,
             opacity,
           );
@@ -323,9 +390,21 @@ export class SplatSpriteCompositor {
       return;
     }
 
-    const nextWeightedCapacity = Math.max(weightedCapacity, 256);
-    const nextHeroCapacity = Math.max(heroCapacity, 64);
-    const nextDepthCapacity = Math.max(depthCapacity, 128);
+    const nextWeightedCapacity = this.resolveCapacity(
+      Math.floor(this.weightedPositionArray.length / 3),
+      weightedCapacity,
+      256,
+    );
+    const nextHeroCapacity = this.resolveCapacity(
+      Math.floor(this.heroPositionArray.length / 3),
+      heroCapacity,
+      64,
+    );
+    const nextDepthCapacity = this.resolveCapacity(
+      Math.floor((this.depthPositionArrays[0]?.length ?? 0) / 3),
+      depthCapacity,
+      128,
+    );
 
     this.weightedPositionArray = new Float32Array(nextWeightedCapacity * 3);
     this.weightedScaleArray = new Float32Array(nextWeightedCapacity * 2);
@@ -430,23 +509,23 @@ export class SplatSpriteCompositor {
     const uvNode = uv();
     const centeredUv = uvNode.sub(vec2(0.5)).mul(2.0);
     const radial = lengthSq(centeredUv);
-    const feather = smoothstep(1.35, 0.0, radial);
-    const gaussian = exp(radial.mul(-3.75));
+    const feather = smoothstep(1.0, 0.22, radial);
+    const gaussian = exp(radial.mul(-6.5));
     const colorNode = instancedBufferAttribute(colorAttribute);
     const opacityNode = instancedBufferAttribute(opacityAttribute);
     const alphaNode = opacityNode.mul(gaussian).mul(feather);
 
     material.positionNode = instancedBufferAttribute(positionAttribute);
     material.scaleNode = instancedBufferAttribute(scaleAttribute);
-    material.colorNode = colorNode.mul(gaussian).mul(feather);
+    material.colorNode = colorNode.mul(alphaNode);
     material.opacityNode = alphaNode;
-    material.maskNode = radial.lessThan(1.5);
+    material.maskNode = radial.lessThan(1.0);
     material.transparent = true;
     material.depthWrite = false;
     material.sizeAttenuation = true;
 
     material.blending = NormalBlending;
-    material.premultipliedAlpha = false;
+    material.premultipliedAlpha = true;
 
     return material;
   }
@@ -538,6 +617,117 @@ export class SplatSpriteCompositor {
     opacityArray[index] = opacity;
   }
 
+  private canUsePreparedPages(): boolean {
+    return this.owner.splatMaterial.debugMode === 'albedo' && this.owner.effectStack.isIdentity();
+  }
+
+  private getPreparedPageCache(
+    page: ReturnType<SplatMesh['getAsset']>['pages'][number],
+  ): PreparedPageCache {
+    const materialVersion = this.owner.getMaterialVersion();
+    const cached = this.preparedPageCache.get(page.id);
+
+    if (cached && cached.materialVersion === materialVersion) {
+      return cached;
+    }
+
+    const baseScales = new Float32Array(page.splatCount * 2);
+    const colors = new Float32Array(page.splatCount * 3);
+    const opacities = new Float32Array(page.splatCount);
+    const tint = this.owner.splatMaterial.tint;
+    const colorGain = this.owner.splatMaterial.colorGain;
+    const pointSize = this.owner.splatMaterial.pointSize;
+    const opacity = this.owner.splatMaterial.opacity;
+
+    for (let splatIndex = 0; splatIndex < page.splatCount; splatIndex += 1) {
+      const sourceOffset = splatIndex * 3;
+      const scaleOffset = splatIndex * 2;
+      const scale = this.resolveBaseSplatScale(page.scales, sourceOffset, pointSize);
+
+      baseScales[scaleOffset + 0] = scale;
+      baseScales[scaleOffset + 1] = scale;
+      colors[sourceOffset + 0] = page.colors[sourceOffset + 0]! * tint.r * colorGain;
+      colors[sourceOffset + 1] = page.colors[sourceOffset + 1]! * tint.g * colorGain;
+      colors[sourceOffset + 2] = page.colors[sourceOffset + 2]! * tint.b * colorGain;
+      opacities[splatIndex] = Math.min(1, opacity * page.opacities[splatIndex]!);
+    }
+
+    const preparedPage: PreparedPageCache = {
+      materialVersion,
+      positions: page.positions,
+      baseScales,
+      colors,
+      opacities,
+    };
+
+    this.preparedPageCache.set(page.id, preparedPage);
+    return preparedPage;
+  }
+
+  private copyPreparedPage(
+    sourcePositions: Float32Array,
+    sourceScales: Float32Array,
+    sourceColors: Float32Array,
+    sourceOpacities: Float32Array,
+    targetPositions: Float32Array,
+    targetScales: Float32Array,
+    targetColors: Float32Array,
+    targetOpacities: Float32Array,
+    targetInstanceOffset: number,
+    scaleMultiplier: number,
+  ): void {
+    targetPositions.set(sourcePositions, targetInstanceOffset * 3);
+    targetColors.set(sourceColors, targetInstanceOffset * 3);
+    targetOpacities.set(sourceOpacities, targetInstanceOffset);
+
+    if (Math.abs(scaleMultiplier - 1) <= 1e-4) {
+      targetScales.set(sourceScales, targetInstanceOffset * 2);
+      return;
+    }
+
+    const targetScaleOffset = targetInstanceOffset * 2;
+
+    for (let index = 0; index < sourceScales.length; index += 1) {
+      targetScales[targetScaleOffset + index] = sourceScales[index]! * scaleMultiplier;
+    }
+  }
+
+  private resolveCapacity(
+    currentCapacity: number,
+    requiredCapacity: number,
+    minimumCapacity: number,
+  ): number {
+    if (requiredCapacity <= currentCapacity) {
+      return Math.max(minimumCapacity, currentCapacity);
+    }
+
+    return Math.max(
+      minimumCapacity,
+      requiredCapacity,
+      Math.ceil(Math.max(1, currentCapacity) * 1.5),
+    );
+  }
+
+  private resolveCoverageScaleBoost(
+    cluster: ReturnType<SplatMesh['getAsset']>['clusters'][number],
+  ): number {
+    const representationGap = cluster.representedSplatCount / Math.max(1, cluster.splatCount);
+    return Math.min(1.85, 1 + Math.log2(Math.max(1, representationGap)) * 0.14);
+  }
+
+  private resolveBaseSplatScale(
+    scales: Float32Array,
+    sourceOffset: number,
+    pointSize = this.owner.splatMaterial.pointSize,
+  ): number {
+    const isotropicScale = Math.max(
+      scales[sourceOffset + 0]!,
+      scales[sourceOffset + 1]!,
+      scales[sourceOffset + 2]!,
+    );
+    return Math.max(0.014, isotropicScale * pointSize * 0.78);
+  }
+
   private resolveDepthSlice(
     x: number,
     y: number,
@@ -559,19 +749,5 @@ export class SplatSpriteCompositor {
     target.set(x, y, z).applyMatrix4(this.owner.matrixWorld).applyMatrix4(camera.matrixWorldInverse);
     this.cameraPositionScratch.copy(target);
     return this.cameraPositionScratch.z;
-  }
-
-  private getCameraBucket(camera: Camera): string {
-    const position = camera.getWorldPosition(this.worldPositionScratch);
-    const forward = camera.getWorldDirection(this.cameraPositionScratch);
-
-    return [
-      Math.round(position.x * 4),
-      Math.round(position.y * 4),
-      Math.round(position.z * 4),
-      Math.round(forward.x * 16),
-      Math.round(forward.y * 16),
-      Math.round(forward.z * 16),
-    ].join(',');
   }
 }

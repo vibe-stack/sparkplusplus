@@ -5,10 +5,8 @@ import {
   SplatQualityGovernor,
   SplatRendererBridge,
   SpzSplatSource,
-  type SplatFrameStatsSnapshot,
 } from '@sparkplusplus/spark';
 import {
-  ACESFilmicToneMapping,
   AmbientLight,
   Box3,
   Clock,
@@ -16,6 +14,7 @@ import {
   DirectionalLight,
   Mesh,
   MeshStandardMaterial,
+  NoToneMapping,
   PerspectiveCamera,
   PlaneGeometry,
   Scene,
@@ -30,6 +29,8 @@ const app = document.querySelector<HTMLDivElement>('#app');
 interface PlaygroundComplexSplatPreset {
   importPointCap: number | null;
   pageCapacity: number;
+  minLeafPoints: number;
+  branching: number;
   visibleBudget: number;
   overdrawBudget: number;
   activePages: number;
@@ -41,6 +42,10 @@ interface PlaygroundComplexSplatPreset {
   temporalStabilityBias: number;
   pointSize: number;
   opacity: number;
+  colorGain: number;
+  targetFrameMs: number;
+  minPixelRatio: number;
+  maxPixelRatio: number;
   useGpuVisibilityReadback: boolean;
   orbitRadiusScale: number;
   orbitHeightScale: number;
@@ -50,34 +55,30 @@ interface PlaygroundComplexSplatPreset {
 
 const COMPLEX_SPLAT_PRESET: PlaygroundComplexSplatPreset = {
   importPointCap: null,
-  pageCapacity: 8_192,
-  visibleBudget: 4_000_000,
-  overdrawBudget: 600_000,
-  activePages: 256,
-  residentPages: 512,
-  uploadsPerFrame: 64,
-  coverageBiasPx: 36,
+  pageCapacity: 1_024,
+  minLeafPoints: 512,
+  branching: 8,
+  visibleBudget: 4_400_000,
+  overdrawBudget: 420_000,
+  activePages: 1_024,
+  residentPages: 2_048,
+  uploadsPerFrame: 256,
+  coverageBiasPx: 0.5,
   peripheralFoveation: 0,
-  heroTiles: 20,
-  temporalStabilityBias: 1.08,
-  pointSize: 6,
-  opacity: 0.99,
-  useGpuVisibilityReadback: true,
+  heroTiles: 14,
+  temporalStabilityBias: 1.35,
+  pointSize: 4.7,
+  opacity: 0.98,
+  colorGain: 1.03,
+  targetFrameMs: 60,
+  minPixelRatio: 0.55,
+  maxPixelRatio: 1.2,
+  useGpuVisibilityReadback: false,
   orbitRadiusScale: 0.66,
   orbitHeightScale: 0.18,
   orbitDepthScale: 0.58,
   lookHeightScale: 0.28,
 };
-
-class LockedQualityGovernor extends SplatQualityGovernor {
-  override observe(_snapshot: SplatFrameStatsSnapshot) {
-    return {
-      level: this.getLevel(),
-      reason: 'locked',
-      budgets: this.getBudgets(),
-    };
-  }
-}
 
 if (!app) {
   throw new Error('Missing #app root');
@@ -112,7 +113,8 @@ async function bootstrap(): Promise<void> {
       ? {}
       : { maxPoints: COMPLEX_SPLAT_PRESET.importPointCap }),
     pageCapacity: COMPLEX_SPLAT_PRESET.pageCapacity,
-    branching: 4,
+    minLeafPoints: COMPLEX_SPLAT_PRESET.minLeafPoints,
+    branching: COMPLEX_SPLAT_PRESET.branching,
   });
   const importedAsset = source.buildAsset();
   const assetBounds = new Box3(
@@ -133,11 +135,11 @@ async function bootstrap(): Promise<void> {
   camera.lookAt(target);
 
   const renderer = new WebGPURenderer({
-    antialias: true,
+    antialias: false,
     alpha: false,
   });
   renderer.outputColorSpace = SRGBColorSpace;
-  renderer.toneMapping = ACESFilmicToneMapping;
+  renderer.toneMapping = NoToneMapping;
   renderer.domElement.classList.add('viewport-canvas');
   viewport.append(renderer.domElement);
   await renderer.init();
@@ -150,17 +152,47 @@ async function bootstrap(): Promise<void> {
   controls.maxDistance = Math.max(assetSize.length() * 4, 12);
   controls.update();
 
-  const resize = () => {
+  let appliedPixelRatio = 0;
+  let appliedWidth = 0;
+  let appliedHeight = 0;
+  let currentRenderScale = 1;
+
+  const applyRendererScale = (renderScale: number) => {
+    currentRenderScale = renderScale;
     const width = viewport.clientWidth;
     const height = viewport.clientHeight;
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-    renderer.setSize(width, height);
+
+    if (width === 0 || height === 0) {
+      return;
+    }
+
+    const clampedRenderScale = Math.max(0.5, Math.min(1, renderScale));
+    const targetPixelRatio = Math.max(
+      COMPLEX_SPLAT_PRESET.minPixelRatio,
+      Math.min(
+        COMPLEX_SPLAT_PRESET.maxPixelRatio,
+        window.devicePixelRatio * clampedRenderScale,
+      ),
+    );
+
+    if (
+      Math.abs(targetPixelRatio - appliedPixelRatio) > 0.04
+      || width !== appliedWidth
+      || height !== appliedHeight
+    ) {
+      renderer.setPixelRatio(targetPixelRatio);
+      renderer.setSize(width, height, false);
+      appliedPixelRatio = targetPixelRatio;
+      appliedWidth = width;
+      appliedHeight = height;
+    }
+
     camera.aspect = width / height;
     camera.updateProjectionMatrix();
   };
 
-  window.addEventListener('resize', resize);
-  resize();
+  window.addEventListener('resize', () => applyRendererScale(currentRenderScale));
+  applyRendererScale(1);
 
   const pressedKeys = new Set<string>();
   const baseFlightSpeed = Math.max(assetSize.length() * 0.35, 2.5);
@@ -221,6 +253,7 @@ async function bootstrap(): Promise<void> {
     material: new SplatMaterial({
       pointSize: COMPLEX_SPLAT_PRESET.pointSize,
       opacity: COMPLEX_SPLAT_PRESET.opacity,
+      colorGain: COMPLEX_SPLAT_PRESET.colorGain,
       tint: 0xffffff,
       debugMode: 'albedo',
     }),
@@ -230,7 +263,7 @@ async function bootstrap(): Promise<void> {
   scene.add(heroSplat);
 
   const bridge = new SplatRendererBridge({
-    governor: new LockedQualityGovernor({
+    governor: new SplatQualityGovernor({
       maxVisibleSplats: COMPLEX_SPLAT_PRESET.visibleBudget,
       maxOverdrawBudget: COMPLEX_SPLAT_PRESET.overdrawBudget,
       maxActivePages: COMPLEX_SPLAT_PRESET.activePages,
@@ -240,7 +273,7 @@ async function bootstrap(): Promise<void> {
       peripheralFoveation: COMPLEX_SPLAT_PRESET.peripheralFoveation,
       heroTileBudget: COMPLEX_SPLAT_PRESET.heroTiles,
       temporalStabilityBias: COMPLEX_SPLAT_PRESET.temporalStabilityBias,
-    }),
+    }, COMPLEX_SPLAT_PRESET.targetFrameMs),
     useGpuVisibility: COMPLEX_SPLAT_PRESET.useGpuVisibilityReadback,
   });
   scene.add(bridge);
@@ -282,7 +315,8 @@ async function bootstrap(): Promise<void> {
     }
 
     controls.update();
-    bridge.update(scene, camera, deltaSeconds, renderer);
+    const snapshot = bridge.update(scene, camera, deltaSeconds, renderer);
+    applyRendererScale(snapshot.budgets.renderScale);
     renderer.render(scene, camera);
   });
 }

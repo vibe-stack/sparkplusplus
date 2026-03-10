@@ -21,6 +21,8 @@ interface ClusterCandidate {
   projectedSizePx: number;
   screenRadius: number;
   visibleCost: number;
+  proxySplatCount: number;
+  representedSplatCount: number;
 }
 
 interface FrontierBudgetState {
@@ -105,7 +107,7 @@ export class BootstrapVisibilityScheduler {
     // never 0-lag; requiring 0-lag during motion meant the GPU path was NEVER
     // used while the camera was moving, permanently falling back to the slower
     // CPU refinement path.
-    const acceptableGpuLagFrames = 1;
+    const acceptableGpuLagFrames = 2;
     const effectiveGpuVisibility = gpuVisibility && frameIndex - gpuVisibility.frameIndex <= acceptableGpuLagFrames
       ? gpuVisibility
       : undefined;
@@ -622,22 +624,42 @@ export class BootstrapVisibilityScheduler {
             continue;
           }
 
-          const childVisibleSplats = children.reduce(
-            (sum, child) => sum + asset.pages[asset.clusters[child.clusterId]!.pageId]!.splatCount,
-            0,
+          let accumulatedScore = 0;
+          let accumulatedVisibleCost = 0;
+          let accumulatedOverdraw = 0;
+          const targetSubsetSize = Math.max(
+            2,
+            Math.ceil(parent.projectedSizePx / Math.max(1, budgets.minProjectedNodeSizePx * 1.35)),
           );
-          const childOverdraw = children.reduce((sum, child) => sum + this.getCandidateOverdraw(child), 0);
-          const parentPage = asset.pages[cluster.pageId]!;
+          const maxSubsetSize = Math.min(children.length, targetSubsetSize);
 
-          refinementOptions.push({
-            descriptor,
-            parent,
-            children,
-            deltaPageSlots: children.length - 1,
-            deltaVisibleSplats: children.reduce((sum, child) => sum + child.visibleCost, 0) - parent.visibleCost,
-            deltaOverdraw: childOverdraw - this.getCandidateOverdraw(parent),
-            priority: children.reduce((sum, child) => sum + child.score, 0) - parent.score + parent.projectedSizePx * 0.05,
-          });
+          for (let subsetSize = 1; subsetSize <= maxSubsetSize; subsetSize += 1) {
+            const child = children[subsetSize - 1]!;
+            accumulatedScore += child.score;
+            accumulatedVisibleCost += child.visibleCost;
+            accumulatedOverdraw += this.getCandidateOverdraw(child);
+
+            if (subsetSize === 1 && children.length > 1) {
+              continue;
+            }
+
+            const selectedChildren = children.slice(0, subsetSize);
+            refinementOptions.push({
+              descriptor,
+              parent,
+              children: selectedChildren,
+              deltaPageSlots: selectedChildren.length - 1,
+              deltaVisibleSplats: accumulatedVisibleCost - parent.visibleCost,
+              deltaOverdraw: accumulatedOverdraw - this.getCandidateOverdraw(parent),
+              priority: accumulatedScore
+                - parent.score
+                + parent.projectedSizePx * 0.05
+                + Math.log2(
+                  Math.max(1, parent.representedSplatCount / Math.max(1, parent.proxySplatCount)),
+                ) * parent.projectedSizePx * 0.08
+                + subsetSize * 0.12,
+            });
+          }
         }
       }
 
@@ -681,7 +703,9 @@ export class BootstrapVisibilityScheduler {
     const refinementHysteresis = hasPinnedDescendantSelection(candidate.clusterId)
       ? 0.68 + (1 - motionDamping) * 0.24
       : 0.9 + (1 - motionDamping) * 0.08;
-    return candidate.projectedSizePx > budgets.minProjectedNodeSizePx * refinementHysteresis;
+    const representationGap = candidate.representedSplatCount / Math.max(1, candidate.proxySplatCount);
+    const detailPressure = Math.min(1.8, 1 + Math.log2(Math.max(1, representationGap)) * 0.18);
+    return candidate.projectedSizePx * detailPressure > budgets.minProjectedNodeSizePx * refinementHysteresis;
   }
 
   private hasPinnedDescendant(
@@ -753,9 +777,17 @@ export class BootstrapVisibilityScheduler {
     frontierBudgetState: FrontierBudgetState,
     budgets: SplatBudgetOptions,
   ): boolean {
-    return frontierBudgetState.reservedPageSlots + option.deltaPageSlots <= budgets.maxActivePages
-      && frontierBudgetState.reservedVisibleSplats + option.deltaVisibleSplats <= budgets.maxVisibleSplats
-      && frontierBudgetState.reservedOverdraw + option.deltaOverdraw <= budgets.maxOverdrawBudget;
+    const closeUpFactor = Math.min(
+      1.9,
+      Math.max(1, option.parent.projectedSizePx / Math.max(1, budgets.minProjectedNodeSizePx * 2.2)),
+    );
+    const pageLimit = Math.round(budgets.maxActivePages * Math.min(1.45, 1 + (closeUpFactor - 1) * 0.28));
+    const visibleLimit = Math.round(budgets.maxVisibleSplats * Math.min(1.8, 1 + (closeUpFactor - 1) * 0.7));
+    const overdrawLimit = Math.round(budgets.maxOverdrawBudget * Math.min(1.6, 1 + (closeUpFactor - 1) * 0.42));
+
+    return frontierBudgetState.reservedPageSlots + option.deltaPageSlots <= pageLimit
+      && frontierBudgetState.reservedVisibleSplats + option.deltaVisibleSplats <= visibleLimit
+      && frontierBudgetState.reservedOverdraw + option.deltaOverdraw <= overdrawLimit;
   }
 
   private replaceFrontierCandidate(
@@ -915,11 +947,11 @@ export class BootstrapVisibilityScheduler {
 
   private getCandidateOverdraw(candidate: ClusterCandidate): number {
     const cluster = candidate.descriptor.mesh.getAsset().clusters[candidate.clusterId]!;
-    // Cap the screen-fill multiplier: when inside/close to a model the screen radius
-    // becomes thousands of pixels, making overdraw astronomically large and blocking
-    // all but the first frontier cluster.  Clamp to an 8-tile equivalent maximum.
-    const screenFill = Math.min(3.0, Math.max(0.35, candidate.screenRadius / 72));
-    return cluster.expectedOverdrawScore * screenFill;
+    const closeUpPressure = Math.max(1, candidate.projectedSizePx / 96);
+    const screenFill = Math.min(1.45, Math.max(0.28, candidate.screenRadius / 120));
+    const leafRelief = cluster.childIds.length === 0 ? 0.42 : 1;
+    const closeUpRelief = 1 / Math.min(2.4, Math.max(1, closeUpPressure * 0.75));
+    return cluster.expectedOverdrawScore * screenFill * leafRelief * Math.max(0.42, closeUpRelief);
   }
 
   private allocateResidentCapacities(
@@ -969,6 +1001,9 @@ export class BootstrapVisibilityScheduler {
     const mesh = descriptor.mesh;
     const asset = mesh.getAsset();
     const cluster = asset.clusters[clusterId]!;
+    const page = asset.pages[cluster.pageId]!;
+    const proxySplatCount = Math.max(1, page.splatCount);
+    const representedSplatCount = Math.max(proxySplatCount, cluster.representedSplatCount);
     const gpuResult = gpuVisibility?.get(mesh.uuid, clusterId) ?? null;
     let projectedSizePx = 0;
     let screenRadius = 0;
@@ -1023,11 +1058,21 @@ export class BootstrapVisibilityScheduler {
     const closeUpPressure = Math.max(1, projectedSizePx / Math.max(1, budgets.minProjectedNodeSizePx));
     const detailCredit = Math.min(5, Math.pow(closeUpPressure, 0.85));
     const refinementCredit = cluster.childIds.length > 0 ? 1.15 : 1;
+    const leafCredit = cluster.childIds.length === 0 ? 1.4 : 1;
+    const closeUpCredit = Math.min(3.2, 1 + Math.max(0, closeUpPressure - 1) * 0.8);
+    const representationGap = representedSplatCount / proxySplatCount;
+    const detailDebtWeight = Math.min(2.6, 1 + Math.log2(Math.max(1, representationGap)) * 0.3);
     const visibleCost = Math.max(
-      192,
-      Math.round(asset.pages[cluster.pageId]!.splatCount / (detailCredit * residencyWeight * refinementCredit)),
+      cluster.childIds.length === 0 ? 48 : 96,
+      Math.round(
+        proxySplatCount
+        / (detailCredit * residencyWeight * refinementCredit * leafCredit * closeUpCredit),
+      ),
     );
-    const densityPenalty = 1 + cluster.expectedOverdrawScore / Math.max(1, budgets.maxOverdrawBudget);
+    const densityPenalty = 1 + cluster.expectedOverdrawScore / Math.max(
+      1,
+      budgets.maxOverdrawBudget * (cluster.childIds.length === 0 ? 1.75 : 1),
+    );
     const score = (
       projectedSizePx
       * cluster.projectedErrorCoefficient
@@ -1036,6 +1081,8 @@ export class BootstrapVisibilityScheduler {
       * temporalWeight
       * semanticWeight
       * residencyWeight
+      * detailDebtWeight
+      * leafCredit
       * Math.min(1.8, 0.9 + closeUpPressure * 0.22)
     ) / densityPenalty;
 
@@ -1046,6 +1093,8 @@ export class BootstrapVisibilityScheduler {
       projectedSizePx,
       screenRadius,
       visibleCost,
+      proxySplatCount,
+      representedSplatCount,
     };
   }
 

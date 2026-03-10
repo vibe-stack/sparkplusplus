@@ -25,6 +25,7 @@ export interface SplatClusterNode {
   pageId: number;
   level: number;
   splatCount: number;
+  representedSplatCount: number;
   center: SplatVec3;
   radius: number;
   boundsMin: SplatVec3;
