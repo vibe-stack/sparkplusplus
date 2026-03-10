@@ -161,23 +161,43 @@ export class SplatGpuVisibilityPipeline {
     void renderer.computeAsync([this.worldSphereComputeNode, this.cullScoreComputeNode]).then(async () => {
       const arrayBuffer = await renderer.getArrayBufferAsync!(scoreAttribute);
       const raw = new Float32Array(arrayBuffer);
+      const expectedValueCount = clusterCount * 4;
+
+      if (raw.length < expectedValueCount) {
+        return;
+      }
+
       const resultMap = new Map<string, SplatGpuClusterResult>();
       const sortedVisibleClustersByMesh = new Map<string, Array<{ clusterId: number; score: number }>>();
 
       for (let clusterIndex = 0; clusterIndex < clusterCount; clusterIndex += 1) {
         const mapping = clusterMappings[clusterIndex]!;
         const offset = clusterIndex * 4;
+        const rawScore = raw[offset + 0]!;
+        const rawProjectedSizePx = raw[offset + 1]!;
+        const rawScreenRadius = raw[offset + 2]!;
+        const rawVisibility = raw[offset + 3]!;
+
+        if (
+          !Number.isFinite(rawScore)
+          || !Number.isFinite(rawProjectedSizePx)
+          || !Number.isFinite(rawScreenRadius)
+          || !Number.isFinite(rawVisibility)
+        ) {
+          return;
+        }
+
         const previous = this.latestResultMap.get(mapping.key);
-        const visible = raw[offset + 3]! > 0.5;
+        const visible = rawVisibility > 0.5;
         const projectedSizePx = previous && visible && previous.visible
-          ? raw[offset + 1]! * 0.72 + previous.projectedSizePx * 0.28
-          : raw[offset + 1]!;
+          ? Math.max(0, rawProjectedSizePx) * 0.72 + previous.projectedSizePx * 0.28
+          : Math.max(0, rawProjectedSizePx);
         const screenRadius = previous && visible && previous.visible
-          ? raw[offset + 2]! * 0.72 + previous.screenRadius * 0.28
-          : raw[offset + 2]!;
+          ? Math.max(0, rawScreenRadius) * 0.72 + previous.screenRadius * 0.28
+          : Math.max(0, rawScreenRadius);
         const score = previous && visible && previous.visible
-          ? raw[offset + 0]! * 0.7 + previous.score * 0.3
-          : raw[offset + 0]!;
+          ? Math.max(0, rawScore) * 0.7 + previous.score * 0.3
+          : Math.max(0, rawScore);
 
         resultMap.set(mapping.key, {
           visible,

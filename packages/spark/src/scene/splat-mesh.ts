@@ -2,7 +2,7 @@ import { Object3D } from 'three';
 import { SplatPageTable } from '../assets/page-table';
 import type { SplatAsset } from '../assets/model';
 import type { SplatCompositorFrameContext, SplatCompositorSnapshot } from '../compositor/sprite-compositor';
-import { SplatSpriteCompositor } from '../compositor/sprite-compositor';
+import { SplatTileCompositor } from '../compositor/sprite-compositor';
 import { SplatEffectStack } from './effects';
 import { SplatMaterial } from './material';
 import type { SplatSource } from './source';
@@ -36,7 +36,7 @@ export class SplatMesh extends Object3D {
   private asset?: SplatAsset;
   private pageTable?: SplatPageTable;
   private selection: SplatMeshSelection = DEFAULT_SELECTION;
-  private readonly compositor: SplatSpriteCompositor;
+  private readonly compositor: SplatTileCompositor;
 
   constructor(options: SplatMeshOptions) {
     super();
@@ -44,7 +44,7 @@ export class SplatMesh extends Object3D {
     this.splatMaterial = options.material ?? new SplatMaterial();
     this.effectStack = options.effects ?? new SplatEffectStack();
     this.importance = options.importance ?? 1;
-    this.compositor = new SplatSpriteCompositor(this);
+    this.compositor = new SplatTileCompositor(this);
   }
 
   getAsset(): SplatAsset {

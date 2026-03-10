@@ -11,14 +11,14 @@ Spark++ currently has prototype paths in place:
 - real SPZ import into a hierarchical paged runtime asset
 - a mixed-depth bootstrap scheduler inside three.js scene semantics
 - optional GPU visibility readback feeding scheduler scores
-- a baseline sprite compositor that coexists with normal three.js meshes
+- a tile-classified multi-queue sprite compositor that coexists with normal three.js meshes
 
-This is not yet the final performance architecture. The current demo still expands active pages and builds compositor queues on the CPU, and the baseline compositor is still an approximation rather than the final tiled resolve path.
+This is not yet the final performance architecture. The current demo still expands active pages and builds compositor queues on the CPU, but the compositor path is already tile-classified rather than a single flat sprite pass.
 
 ## Known limitations
 
 - Close-up coherence and frame pacing on large multi-million-splat scans are still being hardened.
-- GPU visibility exists, but the playground currently defaults to the CPU scheduler path because the readback path still needs more stability work.
+- GPU visibility readback is enabled by default; invalid or late readbacks now fall back to the most recent good frame before dropping to CPU scheduling.
 - Medium-complexity depth-sliced resolve and local hero resolve are not finished yet.
 
 ## Workspace

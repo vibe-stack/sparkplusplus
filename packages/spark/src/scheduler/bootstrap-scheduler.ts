@@ -20,7 +20,8 @@ interface ClusterCandidate {
   score: number;
   projectedSizePx: number;
   screenRadius: number;
-  cameraDistance: number;
+  screenRadialDistance: number;
+  screenCenterWeight: number;
   visibleCost: number;
   proxySplatCount: number;
   representedSplatCount: number;
@@ -119,11 +120,11 @@ export class BootstrapVisibilityScheduler {
       this.smoothedCameraMotionFactor * 0.82,
     );
     this.cameraMotionFactor = this.smoothedCameraMotionFactor;
-    // Always accept GPU data up to 1 frame old.  GPU readback is async and is
-    // never 0-lag; requiring 0-lag during motion meant the GPU path was NEVER
-    // used while the camera was moving, permanently falling back to the slower
-    // CPU refinement path.
-    const acceptableGpuLagFrames = 2;
+    // GPU readback is async and can trail the main render loop by several
+    // frames under load. Hold onto the most recent valid GPU result long
+    // enough for the readback path to remain useful instead of flapping back
+    // to CPU scheduling during short bursts of latency.
+    const acceptableGpuLagFrames = gpuVisibility?.pending ? 8 : 6;
     const effectiveGpuVisibility = gpuVisibility && frameIndex - gpuVisibility.frameIndex <= acceptableGpuLagFrames
       ? gpuVisibility
       : undefined;
@@ -172,47 +173,34 @@ export class BootstrapVisibilityScheduler {
       );
     });
 
-    if (effectiveGpuVisibility?.ready === true) {
-      this.buildGpuFrontier({
-        objects,
-        camera,
-        viewportHeight,
-        budgets,
-        gpuVisibility: effectiveGpuVisibility,
-        frontierBudgetState,
-        meshSelections,
-        frontierCandidates,
-      });
-    } else {
-      rootCandidates.sort((left, right) => right.score - left.score);
+    rootCandidates.sort((left, right) => right.score - left.score);
 
-      for (const rootCandidate of rootCandidates) {
-        const meshSelection = meshSelections.get(rootCandidate.descriptor.mesh.uuid)!;
-        const candidateSet = frontierCandidates.get(rootCandidate.descriptor.mesh.uuid)!;
-        this.tryAddFrontierCandidate(
-          rootCandidate,
-          budgets,
-          frontierBudgetState,
-          meshSelection,
-          candidateSet,
-          meshSelection.frontierClusterIds.length === 0,
-        );
-      }
-
-      this.refineFrontier({
-        objects,
-        camera,
-        viewportHeight,
-        frameIndex,
+    for (const rootCandidate of rootCandidates) {
+      const meshSelection = meshSelections.get(rootCandidate.descriptor.mesh.uuid)!;
+      const candidateSet = frontierCandidates.get(rootCandidate.descriptor.mesh.uuid)!;
+      this.tryAddFrontierCandidate(
+        rootCandidate,
         budgets,
-        gpuVisibility: effectiveGpuVisibility,
         frontierBudgetState,
-        meshSelections,
-        frontierCandidates,
-        prefetchProtectedPageIds,
-        requestPriorityByMesh,
-      });
+        meshSelection,
+        candidateSet,
+        meshSelection.frontierClusterIds.length === 0,
+      );
     }
+
+    this.refineFrontier({
+      objects,
+      camera,
+      viewportHeight,
+      frameIndex,
+      budgets,
+      gpuVisibility: effectiveGpuVisibility,
+      frontierBudgetState,
+      meshSelections,
+      frontierCandidates,
+      prefetchProtectedPageIds,
+      requestPriorityByMesh,
+    });
 
     meshSelections.forEach((selection) => {
       selection.frontierClusterIds.sort((left, right) => left - right);
@@ -667,6 +655,14 @@ export class BootstrapVisibilityScheduler {
             .sort((left, right) => right.score - left.score);
 
           if (children.length === 0) {
+            continue;
+          }
+
+          // GPU visibility is intentionally conservative here: only replace a
+          // parent when every direct child remains scorable. Otherwise keep the
+          // parent as the frontier coverage proxy instead of creating holes
+          // from an incomplete child subset.
+          if (gpuVisibility && children.length !== cluster.childIds.length) {
             continue;
           }
 
@@ -1125,10 +1121,9 @@ export class BootstrapVisibilityScheduler {
       screenRadius = projectedSizePx;
     }
 
-    const cameraDistance = Math.max(0.001, this.currentCameraPosition.distanceTo(this.worldCenter));
     this.projectedCenter.copy(this.worldCenter).project(camera);
-    const radialDistance = Math.min(1.5, Math.hypot(this.projectedCenter.x, this.projectedCenter.y));
-    const foveationWeight = Math.max(0.25, 1 - radialDistance * 0.25 * budgets.peripheralFoveation);
+    const screenRadialDistance = this.getScreenRadialDistance(this.projectedCenter);
+    const screenCenterWeight = this.getScreenCenterWeight(screenRadialDistance, budgets);
     const temporalWeight = mesh.getPreviousFrontierClusterIds().includes(clusterId)
       ? 1 + (budgets.temporalStabilityBias - 1) * Math.max(0, 1 - this.cameraMotionFactor * 1.8)
       : 1;
@@ -1158,7 +1153,7 @@ export class BootstrapVisibilityScheduler {
       projectedSizePx
       * cluster.projectedErrorCoefficient
       * mesh.importance
-      * foveationWeight
+      * screenCenterWeight
       * temporalWeight
       * semanticWeight
       * residencyWeight
@@ -1173,7 +1168,8 @@ export class BootstrapVisibilityScheduler {
       score,
       projectedSizePx,
       screenRadius,
-      cameraDistance,
+      screenRadialDistance,
+      screenCenterWeight,
       visibleCost,
       proxySplatCount,
       representedSplatCount,
@@ -1193,8 +1189,21 @@ export class BootstrapVisibilityScheduler {
   }
 
   private getRequestPriority(candidate: ClusterCandidate): number {
-    const proximityWeight = 1 / Math.max(0.25, candidate.cameraDistance);
-    return proximityWeight * 4096 + candidate.projectedSizePx * 12 + candidate.score * 0.1;
+    return candidate.screenCenterWeight * 4096 + candidate.projectedSizePx * 12 + candidate.score * 0.1;
+  }
+
+  private getScreenRadialDistance(projectedCenter: Vector3): number {
+    return Math.min(1.25, Math.hypot(projectedCenter.x, projectedCenter.y) / Math.SQRT2);
+  }
+
+  private getScreenCenterWeight(
+    screenRadialDistance: number,
+    budgets: SplatBudgetOptions,
+  ): number {
+    const configuredBias = 1 + budgets.peripheralFoveation * 0.85;
+    const centerBoost = 1 + (1 - screenRadialDistance) * 0.45 * configuredBias;
+    const edgePenalty = 1 + screenRadialDistance * 0.72 * configuredBias;
+    return Math.max(0.18, centerBoost / edgePenalty);
   }
 
   private intersectsPaddedFrustum(sphere: Sphere): boolean {

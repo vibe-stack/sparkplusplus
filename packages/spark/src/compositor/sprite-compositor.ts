@@ -753,3 +753,5 @@ export class SplatSpriteCompositor {
     return this.cameraPositionScratch.z;
   }
 }
+
+export { SplatSpriteCompositor as SplatTileCompositor };

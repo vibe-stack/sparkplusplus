@@ -5,11 +5,11 @@ export type SplatFramePassName =
   | 'lod-frontier-selection'
   | 'residency-request-emission'
   | 'active-page-expansion'
-  | 'baseline-compositor-sync';
+  | 'tile-compositor-sync';
 
 export interface SplatFramePassDescriptor {
   name: SplatFramePassName;
-  stage: 'cpu-bootstrap' | 'gpu-visibility' | 'baseline-compositor';
+  stage: 'cpu-bootstrap' | 'gpu-visibility' | 'tile-compositor';
   inputs: readonly string[];
   outputs: readonly string[];
 }
@@ -52,8 +52,8 @@ export const SPARK_FRAME_GRAPH: readonly SplatFramePassDescriptor[] = [
     outputs: ['active page list', 'renderable splat count'],
   },
   {
-    name: 'baseline-compositor-sync',
-    stage: 'baseline-compositor',
+    name: 'tile-compositor-sync',
+    stage: 'tile-compositor',
     inputs: ['active page list', 'material/effect stack'],
     outputs: ['sprite tile queues', 'weighted/hero compositor instances'],
   },
