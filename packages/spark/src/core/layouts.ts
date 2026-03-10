@@ -12,6 +12,13 @@ export const SPLAT_TILE_HEADER_UINTS = 4;
 // Tile entries carry the cluster/page indirection needed by a future GPU tile
 // expansion pass: [clusterId, pageId, depthBucket, quantizedPriority]
 export const SPLAT_TILE_CLUSTER_ENTRY_UINTS = 4;
+// Compute-time tile headers mirror the compact tile graph used by the
+// compositor resolve pass:
+// [entryOffset, entryCount, actualTileWorkItems, overflowCount]
+export const SPLAT_COMPUTE_TILE_HEADER_FLOATS = 4;
+// Compute tile entries carry the per-tile splat expansion indirection:
+// [pageSplatOffset, pageSplatCount, samplingStride, scaleMultiplier]
+export const SPLAT_COMPUTE_TILE_ENTRY_FLOATS = 4;
 
 export interface SplatPackedSceneBuffer {
   descriptors: Float32Array;

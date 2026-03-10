@@ -139,6 +139,7 @@ export class SplatRendererBridge extends Object3D {
         timeSeconds: this.elapsedSeconds,
         frameIndex: this.frameIndex,
         gpuVisibilityReady: gpuVisibility.ready,
+        renderer,
       });
 
       const asset = mesh.getAsset();

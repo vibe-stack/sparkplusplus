@@ -46,6 +46,10 @@ export interface SplatRuntimeBuffers {
   clusterReferences: Uint32Array;
   childIndices: Uint32Array;
   pageDescriptors: Uint32Array;
+  packedPositionsOpacity: Float32Array;
+  packedScales: Float32Array;
+  packedRotations: Float32Array;
+  packedColors: Float32Array;
 }
 
 export interface SplatAsset {
@@ -94,8 +98,14 @@ export function createSplatRuntimeBuffers(
     clusters.reduce((sum, cluster) => sum + cluster.childIds.length, 0),
   );
   const pageDescriptors = new Uint32Array(pages.length * SPLAT_PAGE_DESCRIPTOR_UINTS);
+  const totalSplats = pages.reduce((sum, page) => sum + page.splatCount, 0);
+  const packedPositionsOpacity = new Float32Array(totalSplats * 4);
+  const packedScales = new Float32Array(totalSplats * 4);
+  const packedRotations = new Float32Array(totalSplats * 4);
+  const packedColors = new Float32Array(totalSplats * 4);
 
   let childCursor = 0;
+  let splatCursor = 0;
 
   clusters.forEach((cluster, clusterIndex) => {
     const metadataOffset = clusterIndex * SPLAT_CLUSTER_METADATA_FLOATS;
@@ -134,8 +144,32 @@ export function createSplatRuntimeBuffers(
     pageDescriptors[offset + 3] = page.capacity;
     pageDescriptors[offset + 4] = page.semanticMask;
     pageDescriptors[offset + 5] = page.byteSize;
-    pageDescriptors[offset + 6] = 0;
+    pageDescriptors[offset + 6] = splatCursor;
     pageDescriptors[offset + 7] = 0;
+
+    for (let splatIndex = 0; splatIndex < page.splatCount; splatIndex += 1) {
+      const sourceOffset = splatIndex * 3;
+      const rotationOffset = splatIndex * 4;
+      const packedOffset = (splatCursor + splatIndex) * 4;
+      packedPositionsOpacity[packedOffset + 0] = page.positions[sourceOffset + 0]!;
+      packedPositionsOpacity[packedOffset + 1] = page.positions[sourceOffset + 1]!;
+      packedPositionsOpacity[packedOffset + 2] = page.positions[sourceOffset + 2]!;
+      packedPositionsOpacity[packedOffset + 3] = page.opacities[splatIndex]!;
+      packedScales[packedOffset + 0] = page.scales[sourceOffset + 0]!;
+      packedScales[packedOffset + 1] = page.scales[sourceOffset + 1]!;
+      packedScales[packedOffset + 2] = page.scales[sourceOffset + 2]!;
+      packedScales[packedOffset + 3] = 0;
+      packedRotations[packedOffset + 0] = page.rotations[rotationOffset + 0]!;
+      packedRotations[packedOffset + 1] = page.rotations[rotationOffset + 1]!;
+      packedRotations[packedOffset + 2] = page.rotations[rotationOffset + 2]!;
+      packedRotations[packedOffset + 3] = page.rotations[rotationOffset + 3]!;
+      packedColors[packedOffset + 0] = page.colors[sourceOffset + 0]!;
+      packedColors[packedOffset + 1] = page.colors[sourceOffset + 1]!;
+      packedColors[packedOffset + 2] = page.colors[sourceOffset + 2]!;
+      packedColors[packedOffset + 3] = 0;
+    }
+
+    splatCursor += page.splatCount;
   });
 
   return {
@@ -143,5 +177,9 @@ export function createSplatRuntimeBuffers(
     clusterReferences,
     childIndices,
     pageDescriptors,
+    packedPositionsOpacity,
+    packedScales,
+    packedRotations,
+    packedColors,
   };
 }

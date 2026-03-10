@@ -103,6 +103,7 @@ export class BootstrapVisibilityScheduler {
   // Smoothing spreads the transition over ~10-15 frames so page uploads keep
   // up and the governor never sees a burst.
   private smoothedCameraMotionFactor = 0;
+  private stableCameraFrames = 0;
   private readonly paddedFrustumSphere = new Sphere();
 
   evaluateScene(options: {
@@ -120,6 +121,9 @@ export class BootstrapVisibilityScheduler {
       this.smoothedCameraMotionFactor * 0.82,
     );
     this.cameraMotionFactor = this.smoothedCameraMotionFactor;
+    this.stableCameraFrames = instantMotionFactor < 0.004
+      ? this.stableCameraFrames + 1
+      : 0;
     // GPU readback is async and can trail the main render loop by several
     // frames under load. Hold onto the most recent valid GPU result long
     // enough for the readback path to remain useful instead of flapping back
@@ -200,6 +204,17 @@ export class BootstrapVisibilityScheduler {
       frontierCandidates,
       prefetchProtectedPageIds,
       requestPriorityByMesh,
+    });
+
+    this.stabilizeFrontier({
+      objects,
+      camera,
+      viewportHeight,
+      budgets,
+      gpuVisibility: effectiveGpuVisibility,
+      frontierBudgetState,
+      meshSelections,
+      frontierCandidates,
     });
 
     meshSelections.forEach((selection) => {
@@ -738,6 +753,113 @@ export class BootstrapVisibilityScheduler {
     }
   }
 
+  private stabilizeFrontier(options: {
+    objects: readonly SplatSceneObjectDescriptor[];
+    camera: Camera;
+    viewportHeight: number;
+    budgets: SplatBudgetOptions;
+    gpuVisibility: SplatGpuVisibilityReadback | undefined;
+    frontierBudgetState: FrontierBudgetState;
+    meshSelections: Map<string, SplatMeshSelection>;
+    frontierCandidates: Map<string, Map<number, ClusterCandidate>>;
+  }): void {
+    if (this.cameraMotionFactor > 0.025 || this.stableCameraFrames < 3) {
+      return;
+    }
+
+    const {
+      objects,
+      camera,
+      viewportHeight,
+      budgets,
+      gpuVisibility,
+      frontierBudgetState,
+      meshSelections,
+      frontierCandidates,
+    } = options;
+
+    for (const descriptor of objects) {
+      const mesh = descriptor.mesh;
+      const asset = mesh.getAsset();
+      const pageTable = mesh.getPageTable();
+      const selection = meshSelections.get(mesh.uuid)!;
+      const meshFrontierCandidates = frontierCandidates.get(mesh.uuid)!;
+      const previousFrontier = mesh.getPreviousFrontierClusterIds();
+
+      if (previousFrontier.length === 0 || selection.frontierClusterIds.length === 0) {
+        continue;
+      }
+
+      const previousFrontierSet = new Set(previousFrontier);
+      const currentFrontierSet = new Set(selection.frontierClusterIds);
+      const newcomers = selection.frontierClusterIds
+        .filter((clusterId) => !previousFrontierSet.has(clusterId))
+        .map((clusterId) => meshFrontierCandidates.get(clusterId))
+        .filter((candidate): candidate is ClusterCandidate => candidate !== undefined)
+        .sort((left, right) => left.score - right.score);
+
+      if (newcomers.length === 0) {
+        continue;
+      }
+
+      for (const previousClusterId of previousFrontier) {
+        if (currentFrontierSet.has(previousClusterId)) {
+          continue;
+        }
+
+        const previousCandidate = this.scoreCandidate(
+          descriptor,
+          previousClusterId,
+          camera,
+          viewportHeight,
+          pageTable,
+          budgets,
+          gpuVisibility,
+        );
+
+        if (!previousCandidate) {
+          continue;
+        }
+
+        const previousRootClusterId = this.getRootClusterId(previousClusterId, asset);
+        const replacementIndex = newcomers.findIndex((newcomer) => {
+          if (this.getRootClusterId(newcomer.clusterId, asset) !== previousRootClusterId) {
+            return false;
+          }
+
+          if (newcomer.score > previousCandidate.score * 1.08) {
+            return false;
+          }
+
+          if (previousCandidate.visibleCost > newcomer.visibleCost * 1.05) {
+            return false;
+          }
+
+          return this.getCandidateOverdraw(previousCandidate) <= this.getCandidateOverdraw(newcomer) * 1.05;
+        });
+
+        if (replacementIndex === -1) {
+          continue;
+        }
+
+        this.swapFrontierCandidate(
+          newcomers[replacementIndex]!,
+          previousCandidate,
+          frontierBudgetState,
+          selection,
+          meshFrontierCandidates,
+        );
+        currentFrontierSet.delete(newcomers[replacementIndex]!.clusterId);
+        currentFrontierSet.add(previousCandidate.clusterId);
+        newcomers.splice(replacementIndex, 1);
+
+        if (newcomers.length === 0) {
+          break;
+        }
+      }
+    }
+  }
+
   private shouldRefineCandidate(
     candidate: ClusterCandidate,
     hasPinnedDescendantSelection: (clusterId: number) => boolean,
@@ -752,6 +874,16 @@ export class BootstrapVisibilityScheduler {
       ? 0.68 + (1 - motionDamping) * 0.24
       : 0.9 + (1 - motionDamping) * 0.08;
     const representationGap = candidate.representedSplatCount / Math.max(1, candidate.proxySplatCount);
+    const closeUpPressure = candidate.projectedSizePx / Math.max(1, budgets.minProjectedNodeSizePx);
+
+    if (representationGap > 1.15 && closeUpPressure > 1.1) {
+      return true;
+    }
+
+    if (representationGap > 1.8 && closeUpPressure > 0.8) {
+      return true;
+    }
+
     const detailPressure = Math.min(1.8, 1 + Math.log2(Math.max(1, representationGap)) * 0.18);
     return candidate.projectedSizePx * detailPressure > budgets.minProjectedNodeSizePx * refinementHysteresis;
   }
@@ -918,6 +1050,38 @@ export class BootstrapVisibilityScheduler {
     frontierBudgetState.reservedVisibleSplats += candidate.visibleCost;
     frontierBudgetState.reservedOverdraw += overdraw;
     frontierCandidates.set(candidate.clusterId, candidate);
+  }
+
+  private swapFrontierCandidate(
+    outgoing: ClusterCandidate,
+    incoming: ClusterCandidate,
+    frontierBudgetState: FrontierBudgetState,
+    meshSelection: SplatMeshSelection,
+    frontierCandidates: Map<number, ClusterCandidate>,
+  ): void {
+    const outgoingOverdraw = this.getCandidateOverdraw(outgoing);
+    const incomingOverdraw = this.getCandidateOverdraw(incoming);
+    const clusterIndex = meshSelection.frontierClusterIds.indexOf(outgoing.clusterId);
+
+    if (clusterIndex === -1) {
+      return;
+    }
+
+    meshSelection.frontierClusterIds[clusterIndex] = incoming.clusterId;
+    meshSelection.estimatedOverdraw = Math.max(
+      0,
+      meshSelection.estimatedOverdraw - outgoingOverdraw + incomingOverdraw,
+    );
+    frontierBudgetState.reservedVisibleSplats = Math.max(
+      0,
+      frontierBudgetState.reservedVisibleSplats - outgoing.visibleCost + incoming.visibleCost,
+    );
+    frontierBudgetState.reservedOverdraw = Math.max(
+      0,
+      frontierBudgetState.reservedOverdraw - outgoingOverdraw + incomingOverdraw,
+    );
+    frontierCandidates.delete(outgoing.clusterId);
+    frontierCandidates.set(incoming.clusterId, incoming);
   }
 
   private getRootClusterId(
@@ -1125,7 +1289,9 @@ export class BootstrapVisibilityScheduler {
     const screenRadialDistance = this.getScreenRadialDistance(this.projectedCenter);
     const screenCenterWeight = this.getScreenCenterWeight(screenRadialDistance, budgets);
     const temporalWeight = mesh.getPreviousFrontierClusterIds().includes(clusterId)
-      ? 1 + (budgets.temporalStabilityBias - 1) * Math.max(0, 1 - this.cameraMotionFactor * 1.8)
+      ? 1 + (budgets.temporalStabilityBias - 1)
+        * Math.max(0, 1 - this.cameraMotionFactor * 1.8)
+        * Math.min(1.35, 1 + this.stableCameraFrames * 0.04)
       : 1;
     const semanticWeight = hasSemanticFlag(cluster.semanticMask, 'hero') ? 1.35 : 1;
     const residencyWeight = pageTable.getState(cluster.pageId).state === SplatPageResidencyState.Resident
@@ -1134,10 +1300,10 @@ export class BootstrapVisibilityScheduler {
     const closeUpPressure = Math.max(1, projectedSizePx / Math.max(1, budgets.minProjectedNodeSizePx));
     const detailCredit = Math.min(5, Math.pow(closeUpPressure, 0.85));
     const refinementCredit = cluster.childIds.length > 0 ? 1.15 : 1;
-    const leafCredit = cluster.childIds.length === 0 ? 1.4 : 1;
-    const closeUpCredit = Math.min(3.2, 1 + Math.max(0, closeUpPressure - 1) * 0.8);
+    const leafCredit = cluster.childIds.length === 0 ? 1.8 : 1;
+    const closeUpCredit = Math.min(4.6, 1 + Math.max(0, closeUpPressure - 1) * 1.15);
     const representationGap = representedSplatCount / proxySplatCount;
-    const detailDebtWeight = Math.min(2.6, 1 + Math.log2(Math.max(1, representationGap)) * 0.3);
+    const detailDebtWeight = Math.min(5.4, 1 + Math.log2(Math.max(1, representationGap)) * 0.7);
     const visibleCost = Math.max(
       cluster.childIds.length === 0 ? 48 : 96,
       Math.round(

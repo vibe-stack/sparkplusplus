@@ -1,5 +1,4 @@
 import {
-  AdditiveBlending,
   BufferAttribute,
   BufferGeometry,
   Color,
@@ -8,25 +7,57 @@ import {
   InstancedBufferAttribute,
   LineBasicMaterial,
   LineSegments,
+  Matrix4,
+  Mesh,
+  OrthographicCamera,
+  PerspectiveCamera,
+  PlaneGeometry,
+  Quaternion,
+  NormalBlending,
   Sprite,
+  Vector3,
+  Vector4,
 } from 'three';
-import { SpriteNodeMaterial } from 'three/webgpu';
 import {
+  MeshBasicNodeMaterial,
+  SpriteNodeMaterial,
+  StorageInstancedBufferAttribute,
+  StorageTexture,
+} from 'three/webgpu';
+import {
+  Break,
+  Fn,
+  If,
+  Loop,
   atan,
+  clamp,
   cross,
   exp,
+  float,
   instancedBufferAttribute,
+  instanceIndex,
+  min,
   max,
   modelViewMatrix,
   smoothstep,
+  storage,
+  texture,
+  textureStore,
   sqrt,
+  uint,
   uv,
+  uniform,
   vec2,
   vec3,
   vec4,
+  uvec2,
 } from 'three/tsl';
 import type { Camera } from 'three';
 import { lengthSq } from 'three/tsl';
+import {
+  SPLAT_COMPUTE_TILE_ENTRY_FLOATS,
+  SPLAT_COMPUTE_TILE_HEADER_FLOATS,
+} from '../core/layouts';
 import {
   SplatClusterTileBinner,
   type SplatClusterTileBinningSnapshot,
@@ -34,6 +65,7 @@ import {
 } from './cluster-tile-binner';
 import { SPLAT_SEMANTIC_FLAGS } from '../core/semantics';
 import type { SplatBudgetOptions } from '../core/budgets';
+import type { SplatGpuRendererLike } from '../gpu/visibility';
 import type { SplatMeshSelection } from '../scheduler/bootstrap-scheduler';
 import type { SplatMesh } from '../scene/splat-mesh';
 
@@ -64,6 +96,7 @@ export interface SplatCompositorFrameContext {
   timeSeconds: number;
   frameIndex: number;
   gpuVisibilityReady: boolean;
+  renderer: SplatGpuRendererLike | undefined;
 }
 
 const EMPTY_SNAPSHOT: SplatCompositorSnapshot = {
@@ -93,37 +126,86 @@ interface PreparedPageCache {
   opacities: Float32Array;
 }
 
+interface ComputeTileFrame {
+  totalWorkItems: number;
+  maxTileWorkItems: number;
+  tileHeaderBytes: number;
+  tileEntryBytes: number;
+}
+
+const COMPUTE_WORKGROUP_SIZE = 64;
+const COMPUTE_MAX_SAMPLING_STRIDE = 12;
+const COMPUTE_ALPHA_CUTOFF = 0.992;
+
 export class SplatSpriteCompositor {
   private readonly preparedPageCache = new Map<number, PreparedPageCache>();
   private readonly tileBinner = new SplatClusterTileBinner();
 
-  private sprite?: Sprite;
-  private material?: SpriteNodeMaterial;
+  private cpuSprite: Sprite | undefined;
+  private cpuMaterial: SpriteNodeMaterial | undefined;
   private positionAttribute?: InstancedBufferAttribute;
   private scaleAttribute?: InstancedBufferAttribute;
   private rotationAttribute?: InstancedBufferAttribute;
   private colorAttribute?: InstancedBufferAttribute;
   private opacityAttribute?: InstancedBufferAttribute;
-  private clusterBoundsOverlay?: LineSegments;
-  private clusterBoundsGeometry?: BufferGeometry;
-  private clusterBoundsMaterial?: LineBasicMaterial;
-  private clusterBoundsPositionAttribute?: BufferAttribute;
-  private clusterBoundsColorAttribute?: BufferAttribute;
+  private gpuSprite: Sprite | undefined;
+  private gpuMaterial: SpriteNodeMaterial | undefined;
+  private gpuSelectionAttribute: StorageInstancedBufferAttribute | undefined;
+  private gpuPackedPositionsOpacityAttribute: StorageInstancedBufferAttribute | undefined;
+  private gpuPackedScalesAttribute: StorageInstancedBufferAttribute | undefined;
+  private gpuPackedRotationsAttribute: StorageInstancedBufferAttribute | undefined;
+  private gpuPackedColorsAttribute: StorageInstancedBufferAttribute | undefined;
+  private computeOverlay: Mesh | undefined;
+  private computeOverlayMaterial: MeshBasicNodeMaterial | undefined;
+  private computeOutputTexture: StorageTexture | undefined;
+  private computeTileHeaderAttribute: StorageInstancedBufferAttribute | undefined;
+  private computeTileEntryAttribute: StorageInstancedBufferAttribute | undefined;
+  private computeNode: any;
+  private clusterBoundsOverlay: LineSegments | undefined;
+  private clusterBoundsGeometry: BufferGeometry | undefined;
+  private clusterBoundsMaterial: LineBasicMaterial | undefined;
+  private clusterBoundsPositionAttribute: BufferAttribute | undefined;
+  private clusterBoundsColorAttribute: BufferAttribute | undefined;
 
   private positionArray = new Float32Array(0);
   private scaleArray = new Float32Array(0);
   private rotationArray = new Float32Array(0);
   private colorArray = new Float32Array(0);
   private opacityArray = new Float32Array(0);
+  private gpuSelectionArray = new Float32Array(0);
+  private computeTileHeaderArray = new Float32Array(0);
+  private computeTileEntryArray = new Float32Array(0);
   private clusterBoundsPositionArray = new Float32Array(0);
   private clusterBoundsColorArray = new Float32Array(0);
 
   private readonly colorScratch = new Color();
   private readonly effectTintScratch = new Color();
   private readonly debugColorScratch = new Color();
+  private readonly computePointSizeParams = new Vector4();
+  private readonly computeTintParams = new Vector4();
+  private readonly computeViewportParams = new Vector4();
+  private readonly computeCameraParams = new Vector4();
+  private readonly computeRangeParams = new Vector4();
+  private readonly computeModelViewRow0 = new Vector4();
+  private readonly computeModelViewRow1 = new Vector4();
+  private readonly computeModelViewRow2 = new Vector4();
+  private readonly computeOverlayPosition = new Vector3();
+  private readonly computeOverlayScale = new Vector3(1, 1, 1);
+  private readonly computeOverlayQuaternion = new Quaternion();
+  private readonly computeForward = new Vector3();
+  private readonly computeOwnerInverseMatrix = new Matrix4();
   private snapshot: SplatCompositorSnapshot = EMPTY_SNAPSHOT;
   private lastBuildSignature = '';
   private lastReductionHash = 2166136261;
+  private gpuMaterialVersion = -1;
+  private computeTileBufferSignature = '';
+  private computeTileFrame: ComputeTileFrame = {
+    totalWorkItems: 0,
+    maxTileWorkItems: 0,
+    tileHeaderBytes: 0,
+    tileEntryBytes: 0,
+  };
+  private readonly stableClusterSamplingStride = new Map<number, number>();
 
   constructor(private readonly owner: SplatMesh) {
     this.ensureCapacity(256);
@@ -158,6 +240,7 @@ export class SplatSpriteCompositor {
     const frameBucket = this.owner.effectStack.hasTemporalEffects()
       ? Math.floor(context.frameIndex / Math.max(1, context.budgets.effectUpdateCadence))
       : 0;
+    const computeMainPath = this.shouldUseComputeMainPath(context, tileBinning);
     const rebuildDependsOnBinning = this.owner.splatMaterial.debugMode === 'tile-occupancy'
       || this.owner.splatMaterial.debugMode === 'tile-heatmap'
       || this.owner.splatMaterial.debugMode === 'depth-buckets';
@@ -166,7 +249,9 @@ export class SplatSpriteCompositor {
       this.owner.getMaterialVersion(),
       this.owner.getEffectVersion(),
       frameBucket,
-      rebuildDependsOnBinning ? tileBinning.debugHash : 'static',
+      computeMainPath ? 'compute' : 'fallback',
+      `${tileBinning.columns}x${tileBinning.rows}@${tileBinning.tileSizePx}`,
+      rebuildDependsOnBinning || computeMainPath ? tileBinning.debugHash : 'static',
       this.lastReductionHash,
     ].join('::');
 
@@ -175,15 +260,53 @@ export class SplatSpriteCompositor {
 
     if (clusteredActiveClusters.length === 0) {
       this.lastBuildSignature = '';
+      this.computeTileBufferSignature = '';
+      this.computeTileFrame = {
+        totalWorkItems: 0,
+        maxTileWorkItems: 0,
+        tileHeaderBytes: 0,
+        tileEntryBytes: 0,
+      };
+      this.syncComputeOverlay(context.camera, context.viewportWidth, context.viewportHeight, false);
+      this.syncGpuSprite(0);
       this.syncSprite(0);
       return;
     }
 
-    if (buildSignature === this.lastBuildSignature) {
+    const buildChanged = buildSignature !== this.lastBuildSignature;
+
+    if (computeMainPath) {
+      this.lastBuildSignature = buildSignature;
+      if (buildChanged) {
+        this.prepareComputeTilePath(clusteredActiveClusters, clusterSamplingStride, tileBinning, context.budgets);
+      }
+      this.dispatchComputeTilePath(context, tileBinning);
+      this.syncGpuSprite(0);
+      this.syncSprite(0);
+      this.snapshot = this.buildSnapshot(this.computeTileFrame.totalWorkItems, tileBinning, {
+        tileWorkPeak: this.computeTileFrame.maxTileWorkItems,
+        tileBufferBytes: tileBinning.buffers.clusterScreenData.byteLength
+          + tileBinning.buffers.tileHeaders.byteLength
+          + tileBinning.buffers.tileEntries.byteLength
+          + this.computeTileFrame.tileHeaderBytes
+          + this.computeTileFrame.tileEntryBytes,
+      });
+      return;
+    }
+
+    this.syncComputeOverlay(context.camera, context.viewportWidth, context.viewportHeight, false);
+
+    if (!buildChanged) {
       return;
     }
 
     this.lastBuildSignature = buildSignature;
+
+    if (this.canUseGpuMainPath(context)) {
+      this.syncGpuTilePath(clusteredActiveClusters, clusterSamplingStride, tileBinning);
+      this.syncSprite(0);
+      return;
+    }
 
     let queueEstimate = 0;
 
@@ -296,6 +419,7 @@ export class SplatSpriteCompositor {
     }
 
     this.flushAttributes(instanceCount);
+    this.syncGpuSprite(0);
     this.syncSprite(instanceCount);
     this.snapshot = this.buildSnapshot(instanceCount, tileBinning);
   }
@@ -320,8 +444,8 @@ export class SplatSpriteCompositor {
   }
 
   private rebuildSprite(): void {
-    if (this.sprite) {
-      this.owner.remove(this.sprite);
+    if (this.cpuSprite) {
+      this.owner.remove(this.cpuSprite);
     }
 
     this.positionAttribute = this.createAttribute(this.positionArray, 3);
@@ -329,19 +453,19 @@ export class SplatSpriteCompositor {
     this.rotationAttribute = this.createAttribute(this.rotationArray, 4);
     this.colorAttribute = this.createAttribute(this.colorArray, 3);
     this.opacityAttribute = this.createAttribute(this.opacityArray, 1);
-    this.material = this.createMaterial(
+    this.cpuMaterial = this.createMaterial(
       this.positionAttribute,
       this.scaleAttribute,
       this.rotationAttribute,
       this.colorAttribute,
       this.opacityAttribute,
     );
-    this.sprite = new Sprite(this.material);
-    this.sprite.count = 0;
-    this.sprite.frustumCulled = false;
-    this.sprite.renderOrder = 21;
-    this.sprite.name = 'SparkSpriteQueue';
-    this.owner.add(this.sprite);
+    this.cpuSprite = new Sprite(this.cpuMaterial);
+    this.cpuSprite.count = 0;
+    this.cpuSprite.frustumCulled = false;
+    this.cpuSprite.renderOrder = 21;
+    this.cpuSprite.name = 'SparkSpriteQueue';
+    this.owner.add(this.cpuSprite);
   }
 
   private createMaterial(
@@ -388,8 +512,8 @@ export class SplatSpriteCompositor {
     material.depthWrite = false;
     material.sizeAttenuation = true;
     material.side = DoubleSide;
-    material.blending = AdditiveBlending;
-    material.premultipliedAlpha = false;
+    material.blending = NormalBlending;
+    material.premultipliedAlpha = true;
 
     return material;
   }
@@ -397,6 +521,20 @@ export class SplatSpriteCompositor {
   private createAttribute(array: Float32Array, itemSize: number): InstancedBufferAttribute {
     const attribute = new InstancedBufferAttribute(array, itemSize);
     attribute.setUsage(DynamicDrawUsage);
+    return attribute;
+  }
+
+  private createStorageAttribute(
+    array: Float32Array,
+    itemSize: number,
+    dynamic: boolean,
+  ): StorageInstancedBufferAttribute {
+    const attribute = new StorageInstancedBufferAttribute(array, itemSize);
+
+    if (dynamic) {
+      attribute.setUsage(DynamicDrawUsage);
+    }
+
     return attribute;
   }
 
@@ -423,17 +561,776 @@ export class SplatSpriteCompositor {
   }
 
   private syncSprite(instanceCount: number): void {
-    if (!this.sprite) {
+    if (!this.cpuSprite) {
       return;
     }
 
-    this.sprite.count = instanceCount;
-    this.sprite.visible = instanceCount > 0;
+    this.cpuSprite.count = instanceCount;
+    this.cpuSprite.visible = instanceCount > 0;
+  }
+
+  private canUseComputeMainPath(context: SplatCompositorFrameContext): boolean {
+    return context.renderer?.hasInitialized?.() !== false
+      && typeof context.renderer?.compute === 'function'
+      && this.owner.effectStack.isIdentity()
+      && this.owner.splatMaterial.debugMode === 'albedo';
+  }
+
+  private shouldUseComputeMainPath(
+    context: SplatCompositorFrameContext,
+    tileBinning: SplatClusterTileBinningSnapshot,
+  ): boolean {
+    if (!this.canUseComputeMainPath(context)) {
+      return false;
+    }
+
+    const maxProjectedRadiusPx = this.resolveMaxProjectedClusterRadius(tileBinning);
+    const activeTileRatio = tileBinning.activeTiles / Math.max(1, tileBinning.columns * tileBinning.rows);
+    const safeTileWorkCeiling = Math.max(
+      48,
+      Math.min(128, Math.round(context.budgets.maxSplatsPerTile * 0.18)),
+    );
+
+    // The current compute path is only viable for low-pressure distant views.
+    // Near-field dense views should stay on the sprite fallback until the tile
+    // compositor is upgraded to workgroup-local expansion/composition.
+    return tileBinning.maxTileSplatEstimate <= safeTileWorkCeiling
+      && tileBinning.overflowedTiles === 0
+      && maxProjectedRadiusPx <= 72
+      && activeTileRatio <= 0.35;
+  }
+
+  private canUseGpuMainPath(context: SplatCompositorFrameContext): boolean {
+    return context.renderer?.hasInitialized?.() !== false
+      && this.owner.effectStack.isIdentity()
+      && (this.owner.splatMaterial.debugMode === 'albedo' || this.owner.splatMaterial.debugMode === 'cluster-bounds');
+  }
+
+  private prepareComputeTilePath(
+    clusteredActiveClusters: ReadonlyArray<SplatMeshSelection['activeClusters'][number]>,
+    clusterSamplingStride: ReadonlyMap<number, number>,
+    tileBinning: SplatClusterTileBinningSnapshot,
+    budgets: SplatBudgetOptions,
+  ): void {
+    const asset = this.owner.getAsset();
+    const tileCount = tileBinning.columns * tileBinning.rows;
+    let totalEntryCount = 0;
+
+    for (const tile of tileBinning.tileBins) {
+      totalEntryCount += tile.clusterIds.length;
+    }
+
+    this.ensureComputeTileCapacity(tileCount, totalEntryCount);
+    const activeClusterById = new Map(
+      clusteredActiveClusters.map((activeCluster) => [activeCluster.clusterId, activeCluster] as const),
+    );
+    const tileHeaderArray = this.computeTileHeaderArray;
+    const tileEntryArray = this.computeTileEntryArray;
+    tileHeaderArray.fill(0);
+    tileEntryArray.fill(0);
+
+    let tileEntryCursor = 0;
+    let totalWorkItems = 0;
+    let maxTileWorkItems = 0;
+
+    // Pass layout:
+    // 1. `tileBinning` already supplies bounded tile ownership and bucket-ordered cluster ids.
+    // 2. The compute tile frame converts that into compact page-level expansion records.
+    // 3. The per-pixel compute resolve reads only the entries owned by its tile.
+    for (const tile of tileBinning.tileBins) {
+      const headerOffset = tile.tileId * SPLAT_COMPUTE_TILE_HEADER_FLOATS;
+      const tileEntryStart = tileEntryCursor;
+      tileHeaderArray[headerOffset + 0] = tileEntryStart;
+      tileHeaderArray[headerOffset + 3] = tile.overflowCount;
+      const tileStrideScale = Math.max(1, Math.ceil(tile.splatEstimate / Math.max(1, budgets.maxSplatsPerTile)));
+
+      let tileWorkItems = 0;
+
+      for (const clusterId of tile.clusterIds) {
+        const activeCluster = activeClusterById.get(clusterId);
+
+        if (!activeCluster) {
+          continue;
+        }
+
+        const cluster = asset.clusters[clusterId]!;
+        const page = asset.pages[activeCluster.pageId]!;
+        const baseSamplingStride = clusterSamplingStride.get(clusterId) ?? 1;
+        const samplingStride = Math.max(
+          1,
+          Math.min(COMPUTE_MAX_SAMPLING_STRIDE, baseSamplingStride * tileStrideScale),
+        );
+        const densityCompensation = this.resolveDensityCompensation(samplingStride);
+        const scaleMultiplier = this.resolveCoverageScaleBoost(cluster, densityCompensation);
+        const pageDescriptorOffset = page.id * 8;
+        const pageSplatOffset = asset.buffers.pageDescriptors[pageDescriptorOffset + 6] ?? 0;
+        const entryOffset = tileEntryCursor * SPLAT_COMPUTE_TILE_ENTRY_FLOATS;
+        const entryWorkItems = Math.ceil(page.splatCount / samplingStride);
+
+        tileEntryArray[entryOffset + 0] = pageSplatOffset;
+        tileEntryArray[entryOffset + 1] = page.splatCount;
+        tileEntryArray[entryOffset + 2] = samplingStride;
+        tileEntryArray[entryOffset + 3] = scaleMultiplier;
+        tileEntryCursor += 1;
+        tileWorkItems += entryWorkItems;
+      }
+
+      tileHeaderArray[headerOffset + 1] = tileEntryCursor - tileEntryStart;
+
+      if (tileWorkItems > budgets.maxSplatsPerTile) {
+        tileHeaderArray[headerOffset + 3] = Math.max(
+          tileHeaderArray[headerOffset + 3] ?? 0,
+          tileWorkItems - budgets.maxSplatsPerTile,
+        );
+      }
+
+      tileHeaderArray[headerOffset + 2] = Math.min(tileWorkItems, budgets.maxSplatsPerTile);
+      totalWorkItems += tileHeaderArray[headerOffset + 2] ?? 0;
+      maxTileWorkItems = Math.max(maxTileWorkItems, tileHeaderArray[headerOffset + 2] ?? 0);
+    }
+
+    if (this.computeTileHeaderAttribute) {
+      this.computeTileHeaderAttribute.needsUpdate = true;
+      this.computeTileHeaderAttribute.clearUpdateRanges();
+      this.computeTileHeaderAttribute.addUpdateRange(0, tileCount * SPLAT_COMPUTE_TILE_HEADER_FLOATS);
+    }
+
+    if (this.computeTileEntryAttribute) {
+      this.computeTileEntryAttribute.needsUpdate = true;
+      this.computeTileEntryAttribute.clearUpdateRanges();
+      this.computeTileEntryAttribute.addUpdateRange(0, tileEntryCursor * SPLAT_COMPUTE_TILE_ENTRY_FLOATS);
+    }
+
+    this.computeTileFrame = {
+      totalWorkItems,
+      maxTileWorkItems,
+      tileHeaderBytes: tileCount * SPLAT_COMPUTE_TILE_HEADER_FLOATS * Float32Array.BYTES_PER_ELEMENT,
+      tileEntryBytes: tileEntryCursor * SPLAT_COMPUTE_TILE_ENTRY_FLOATS * Float32Array.BYTES_PER_ELEMENT,
+    };
+    this.computeTileBufferSignature = [
+      tileBinning.debugHash,
+      this.lastReductionHash,
+      tileBinning.columns,
+      tileBinning.rows,
+      tileEntryCursor,
+    ].join(':');
+  }
+
+  private ensureComputeTileCapacity(tileCount: number, entryCount: number): void {
+    if (this.computeTileHeaderArray.length < tileCount * SPLAT_COMPUTE_TILE_HEADER_FLOATS) {
+      const nextTileCapacity = this.resolveCapacity(
+        Math.floor(this.computeTileHeaderArray.length / SPLAT_COMPUTE_TILE_HEADER_FLOATS),
+        tileCount,
+        64,
+      );
+      this.computeTileHeaderArray = new Float32Array(nextTileCapacity * SPLAT_COMPUTE_TILE_HEADER_FLOATS);
+      this.computeTileHeaderAttribute = this.createStorageAttribute(
+        this.computeTileHeaderArray,
+        SPLAT_COMPUTE_TILE_HEADER_FLOATS,
+        true,
+      );
+      this.computeNode = undefined;
+    }
+
+    if (this.computeTileEntryArray.length < entryCount * SPLAT_COMPUTE_TILE_ENTRY_FLOATS) {
+      const nextEntryCapacity = this.resolveCapacity(
+        Math.floor(this.computeTileEntryArray.length / SPLAT_COMPUTE_TILE_ENTRY_FLOATS),
+        entryCount,
+        256,
+      );
+      this.computeTileEntryArray = new Float32Array(nextEntryCapacity * SPLAT_COMPUTE_TILE_ENTRY_FLOATS);
+      this.computeTileEntryAttribute = this.createStorageAttribute(
+        this.computeTileEntryArray,
+        SPLAT_COMPUTE_TILE_ENTRY_FLOATS,
+        true,
+      );
+      this.computeNode = undefined;
+    }
+  }
+
+  private dispatchComputeTilePath(
+    context: SplatCompositorFrameContext,
+    tileBinning: SplatClusterTileBinningSnapshot,
+  ): void {
+    const renderer = context.renderer;
+
+    if (!renderer || typeof renderer.compute !== 'function') {
+      return;
+    }
+
+    this.ensureComputeResources(context.viewportWidth, context.viewportHeight);
+    this.updateComputeUniforms(context.camera, context.viewportWidth, context.viewportHeight, tileBinning);
+    this.syncComputeOverlay(context.camera, context.viewportWidth, context.viewportHeight, true);
+
+    if (!this.computeNode) {
+      return;
+    }
+
+    renderer.compute(this.computeNode);
+  }
+
+  private ensureComputeResources(viewportWidth: number, viewportHeight: number): void {
+    this.ensurePackedSplatStorageAttributes();
+    const nextWidth = Math.max(1, viewportWidth);
+    const nextHeight = Math.max(1, viewportHeight);
+    const previousImage = this.computeOutputTexture?.image as { width?: number; height?: number } | undefined;
+    const previousWidth = previousImage?.width ?? 0;
+    const previousHeight = previousImage?.height ?? 0;
+    const textureResized = !this.computeOutputTexture || previousWidth !== nextWidth || previousHeight !== nextHeight;
+
+    if (textureResized) {
+      this.computeOutputTexture = new StorageTexture(nextWidth, nextHeight);
+      this.computeNode = undefined;
+      this.rebuildComputeOverlay();
+    }
+
+    this.ensureComputeOverlay();
+
+    if (!this.computeNode) {
+      this.computeNode = this.createComputeNode();
+    }
+  }
+
+  private ensureComputeOverlay(): void {
+    if (this.computeOverlay || !this.computeOutputTexture) {
+      return;
+    }
+
+    const material = new MeshBasicNodeMaterial();
+    const outputNode = texture(this.computeOutputTexture, uv());
+    material.colorNode = outputNode.rgb;
+    material.opacityNode = outputNode.a;
+    material.transparent = true;
+    material.depthWrite = false;
+    material.depthTest = false;
+    material.toneMapped = false;
+    this.computeOverlayMaterial = material;
+    this.computeOverlay = new Mesh(new PlaneGeometry(1, 1), material);
+    this.computeOverlay.frustumCulled = false;
+    this.computeOverlay.renderOrder = 21;
+    this.computeOverlay.matrixAutoUpdate = false;
+    this.computeOverlay.visible = false;
+    this.computeOverlay.name = 'SparkComputeTileResolve';
+    this.owner.add(this.computeOverlay);
+  }
+
+  private rebuildComputeOverlay(): void {
+    if (this.computeOverlay) {
+      this.owner.remove(this.computeOverlay);
+      this.computeOverlay.geometry.dispose();
+      this.computeOverlay = undefined;
+    }
+
+    if (this.computeOverlayMaterial) {
+      this.computeOverlayMaterial.dispose();
+      this.computeOverlayMaterial = undefined;
+    }
+  }
+
+  private ensurePackedSplatStorageAttributes(): void {
+    if (
+      this.gpuPackedPositionsOpacityAttribute
+      && this.gpuPackedScalesAttribute
+      && this.gpuPackedRotationsAttribute
+      && this.gpuPackedColorsAttribute
+    ) {
+      return;
+    }
+
+    const asset = this.owner.getAsset();
+    this.gpuPackedPositionsOpacityAttribute ??= this.createStorageAttribute(
+      asset.buffers.packedPositionsOpacity,
+      4,
+      false,
+    );
+    this.gpuPackedScalesAttribute ??= this.createStorageAttribute(asset.buffers.packedScales, 4, false);
+    this.gpuPackedRotationsAttribute ??= this.createStorageAttribute(asset.buffers.packedRotations, 4, false);
+    this.gpuPackedColorsAttribute ??= this.createStorageAttribute(asset.buffers.packedColors, 4, false);
+  }
+
+  private createComputeNode(): any {
+    if (
+      !this.computeTileHeaderAttribute
+      || !this.computeTileEntryAttribute
+      || !this.gpuPackedPositionsOpacityAttribute
+      || !this.gpuPackedScalesAttribute
+      || !this.gpuPackedColorsAttribute
+      || !this.computeOutputTexture
+    ) {
+      return undefined;
+    }
+
+    const tileHeadersNode = storage(
+      this.computeTileHeaderAttribute,
+      'vec4',
+      Math.max(1, Math.floor(this.computeTileHeaderAttribute.array.length / SPLAT_COMPUTE_TILE_HEADER_FLOATS)),
+    );
+    const tileEntriesNode = storage(
+      this.computeTileEntryAttribute,
+      'vec4',
+      Math.max(1, Math.floor(this.computeTileEntryAttribute.array.length / SPLAT_COMPUTE_TILE_ENTRY_FLOATS)),
+    );
+    const positionsNode = storage(
+      this.gpuPackedPositionsOpacityAttribute,
+      'vec4',
+      Math.max(1, Math.floor(this.gpuPackedPositionsOpacityAttribute.array.length / 4)),
+    );
+    const scalesNode = storage(
+      this.gpuPackedScalesAttribute,
+      'vec4',
+      Math.max(1, Math.floor(this.gpuPackedScalesAttribute.array.length / 4)),
+    );
+    const colorsNode = storage(
+      this.gpuPackedColorsAttribute,
+      'vec4',
+      Math.max(1, Math.floor(this.gpuPackedColorsAttribute.array.length / 4)),
+    );
+    const viewportParams = uniform(this.computeViewportParams);
+    const cameraParams = uniform(this.computeCameraParams);
+    const pointSizeParams = uniform(this.computePointSizeParams);
+    const tintParams = uniform(this.computeTintParams);
+    const rangeParams = uniform(this.computeRangeParams);
+    const modelViewRow0 = uniform(this.computeModelViewRow0);
+    const modelViewRow1 = uniform(this.computeModelViewRow1);
+    const modelViewRow2 = uniform(this.computeModelViewRow2);
+
+    const outputTexture = this.computeOutputTexture;
+    const outputImage = outputTexture.image as { width?: number; height?: number };
+    const outputPixelCount = Math.max(1, (outputImage.width ?? 1) * (outputImage.height ?? 1));
+
+    return Fn(() => {
+      const viewportWidth = max(uint(1), uint(viewportParams.x));
+      const viewportHeight = max(uint(1), uint(viewportParams.y));
+      const tileSizePx = max(uint(1), uint(viewportParams.z));
+      const tileColumns = max(uint(1), uint(viewportParams.w));
+      const pixelIndex = uint(instanceIndex);
+      const pixelX = pixelIndex.mod(viewportWidth);
+      const pixelY = pixelIndex.div(viewportWidth);
+      const pixelCenter = vec2(float(pixelX).add(0.5), float(pixelY).add(0.5));
+      const tileX = pixelX.div(tileSizePx);
+      const tileY = pixelY.div(tileSizePx);
+      const tileIndex = tileY.mul(tileColumns).add(tileX);
+      const tileHeader = tileHeadersNode.element(tileIndex);
+      const entryOffset = uint(tileHeader.x);
+      const entryCount = uint(tileHeader.y);
+      const accumulatedColor = vec3(0, 0, 0).toVar();
+      const accumulatedAlpha = float(0).toVar();
+      const viewportWidthFloat = float(viewportParams.x);
+      const viewportHeightFloat = float(viewportParams.y);
+      const isPerspective = cameraParams.x.greaterThan(0.5);
+
+      Loop(
+        { start: uint(0), end: entryCount, type: 'uint', condition: '<', name: 'entryIndex' },
+        (inputs: any) => {
+          const entryIndex = inputs.entryIndex ?? inputs.i;
+
+          If(accumulatedAlpha.greaterThanEqual(float(COMPUTE_ALPHA_CUTOFF)), () => {
+            Break();
+          });
+
+          const tileEntry = tileEntriesNode.element(entryOffset.add(entryIndex));
+          const pageSplatOffset = uint(tileEntry.x);
+          const pageSplatCount = uint(tileEntry.y);
+          const samplingStride = uint(tileEntry.z).toVar();
+          const scaleMultiplier = tileEntry.w;
+
+          If(samplingStride.lessThan(uint(1)), () => {
+            samplingStride.assign(uint(1));
+          });
+
+          Loop(
+            {
+              start: uint(0),
+              end: pageSplatCount,
+              type: 'uint',
+              condition: '<',
+              name: 'splatOffset',
+              update: samplingStride,
+            },
+            (inputs: any) => {
+              const splatOffset = inputs.splatOffset ?? inputs.i;
+
+              If(accumulatedAlpha.greaterThanEqual(float(COMPUTE_ALPHA_CUTOFF)), () => {
+                Break();
+              });
+
+              const splatIndex = pageSplatOffset.add(splatOffset);
+              const sourcePosition = positionsNode.element(splatIndex);
+              const sourceScale = scalesNode.element(splatIndex);
+              const sourceColor = colorsNode.element(splatIndex);
+              const localPosition = vec4(sourcePosition.xyz, 1);
+              const viewPosition = vec3(
+                modelViewRow0.dot(localPosition),
+                modelViewRow1.dot(localPosition),
+                modelViewRow2.dot(localPosition),
+              );
+              const viewDepth = viewPosition.z.negate().toVar();
+
+              If(viewDepth.greaterThan(rangeParams.x), () => {
+                const ndcX = float(0).toVar();
+                const ndcY = float(0).toVar();
+                const projectedRadiusPx = float(0).toVar();
+                const baseRadius = max(sourceScale.x, max(sourceScale.y, sourceScale.z))
+                  .mul(pointSizeParams.x)
+                  .mul(scaleMultiplier);
+
+                If(isPerspective, () => {
+                  ndcX.assign(viewPosition.x.div(max(viewDepth.mul(cameraParams.y).mul(cameraParams.z), float(0.001))));
+                  ndcY.assign(viewPosition.y.div(max(viewDepth.mul(cameraParams.y), float(0.001))));
+                  projectedRadiusPx.assign(baseRadius.mul(viewportHeightFloat).div(max(viewDepth.mul(cameraParams.y), float(0.001))));
+                }).Else(() => {
+                  ndcX.assign(viewPosition.x.div(max(cameraParams.y, float(0.001))));
+                  ndcY.assign(viewPosition.y.div(max(cameraParams.z, float(0.001))));
+                  projectedRadiusPx.assign(baseRadius.mul(viewportHeightFloat).div(max(cameraParams.z.mul(2), float(0.001))));
+                });
+
+                const screenCenter = vec2(
+                  ndcX.mul(0.5).add(0.5).mul(viewportWidthFloat),
+                  float(0.5).sub(ndcY.mul(0.5)).mul(viewportHeightFloat),
+                );
+                const screenRadius = max(projectedRadiusPx, float(0.6));
+                const normalizedDelta = pixelCenter.sub(screenCenter).div(vec2(screenRadius, screenRadius));
+                const radial = lengthSq(normalizedDelta);
+
+                If(radial.lessThan(1.0), () => {
+                  const feather = smoothstep(1.0, 0.5, radial);
+                  const gaussian = exp(radial.mul(-10.5));
+                  const contributionAlpha = clamp(
+                    sourcePosition.w.mul(pointSizeParams.y).mul(gaussian).mul(feather),
+                    0,
+                    1,
+                  );
+
+                  If(contributionAlpha.greaterThan(0.0015), () => {
+                    const remainingAlpha = float(1).sub(accumulatedAlpha);
+                    const blendedAlpha = contributionAlpha.mul(remainingAlpha);
+                    const shadedColor = sourceColor.xyz.mul(tintParams.xyz).mul(pointSizeParams.z);
+                    accumulatedColor.assign(accumulatedColor.add(shadedColor.mul(blendedAlpha)));
+                    accumulatedAlpha.assign(min(float(1), accumulatedAlpha.add(blendedAlpha)));
+                  });
+                });
+              });
+            },
+          );
+        },
+      );
+
+      const resolvedColor = vec3(0, 0, 0).toVar();
+      If(accumulatedAlpha.greaterThan(0.0001), () => {
+        resolvedColor.assign(accumulatedColor.div(max(accumulatedAlpha, float(0.0001))));
+      });
+
+      textureStore(
+        outputTexture,
+        uvec2(pixelX, pixelY),
+        vec4(resolvedColor, clamp(accumulatedAlpha, 0, 1)),
+      );
+    })().compute(outputPixelCount, [
+      COMPUTE_WORKGROUP_SIZE,
+    ]);
+  }
+
+  private updateComputeUniforms(
+    camera: Camera,
+    viewportWidth: number,
+    viewportHeight: number,
+    tileBinning: SplatClusterTileBinningSnapshot,
+  ): void {
+    this.computeViewportParams.set(
+      viewportWidth,
+      viewportHeight,
+      tileBinning.tileSizePx,
+      tileBinning.columns,
+    );
+
+    if (camera instanceof PerspectiveCamera) {
+      this.computeCameraParams.set(
+        1,
+        Math.max(1e-4, Math.tan((camera.fov * Math.PI) / 360)),
+        Math.max(1e-4, camera.aspect),
+        0,
+      );
+    } else if (camera instanceof OrthographicCamera) {
+      const halfWidth = Math.abs(camera.right - camera.left) / Math.max(2 * camera.zoom, 1e-5);
+      const halfHeight = Math.abs(camera.top - camera.bottom) / Math.max(2 * camera.zoom, 1e-5);
+      this.computeCameraParams.set(0, Math.max(1e-4, halfWidth), Math.max(1e-4, halfHeight), 0);
+    } else {
+      this.computeCameraParams.set(1, 1, Math.max(1e-4, viewportWidth / Math.max(1, viewportHeight)), 0);
+    }
+
+    this.computePointSizeParams.set(
+      this.owner.splatMaterial.pointSize * 0.64,
+      this.owner.splatMaterial.opacity,
+      this.owner.splatMaterial.colorGain,
+      0,
+    );
+    this.computeTintParams.set(
+      this.owner.splatMaterial.tint.r,
+      this.owner.splatMaterial.tint.g,
+      this.owner.splatMaterial.tint.b,
+      0,
+    );
+    this.computeRangeParams.set(this.resolveCameraNear(camera), this.resolveCameraFar(camera), 0, 0);
+
+    const modelViewMatrixWorld = camera.matrixWorldInverse.clone().multiply(this.owner.matrixWorld);
+    this.computeModelViewRow0.set(
+      modelViewMatrixWorld.elements[0]!,
+      modelViewMatrixWorld.elements[4]!,
+      modelViewMatrixWorld.elements[8]!,
+      modelViewMatrixWorld.elements[12]!,
+    );
+    this.computeModelViewRow1.set(
+      modelViewMatrixWorld.elements[1]!,
+      modelViewMatrixWorld.elements[5]!,
+      modelViewMatrixWorld.elements[9]!,
+      modelViewMatrixWorld.elements[13]!,
+    );
+    this.computeModelViewRow2.set(
+      modelViewMatrixWorld.elements[2]!,
+      modelViewMatrixWorld.elements[6]!,
+      modelViewMatrixWorld.elements[10]!,
+      modelViewMatrixWorld.elements[14]!,
+    );
+  }
+
+  private syncComputeOverlay(
+    camera: Camera,
+    viewportWidth: number,
+    viewportHeight: number,
+    visible: boolean,
+  ): void {
+    if (!this.computeOverlay) {
+      return;
+    }
+
+    this.computeOverlay.visible = visible;
+
+    if (!visible) {
+      return;
+    }
+
+    const planeDistance = Math.max(0.25, this.resolveCameraNear(camera) + 0.02);
+    camera.getWorldDirection(this.computeForward);
+    this.computeOverlayPosition.copy(camera.position).addScaledVector(this.computeForward, planeDistance);
+    this.computeOverlayQuaternion.copy(camera.quaternion);
+
+    if (camera instanceof PerspectiveCamera) {
+      const halfHeight = Math.tan((camera.fov * Math.PI) / 360) * planeDistance;
+      const halfWidth = halfHeight * camera.aspect;
+      this.computeOverlayScale.set(halfWidth * 2, halfHeight * 2, 1);
+    } else if (camera instanceof OrthographicCamera) {
+      const halfWidth = Math.abs(camera.right - camera.left) / Math.max(2 * camera.zoom, 1e-5);
+      const halfHeight = Math.abs(camera.top - camera.bottom) / Math.max(2 * camera.zoom, 1e-5);
+      this.computeOverlayScale.set(halfWidth * 2, halfHeight * 2, 1);
+    } else {
+      const aspect = viewportWidth / Math.max(1, viewportHeight);
+      this.computeOverlayScale.set(aspect * 0.6, 0.6, 1);
+    }
+
+    this.computeOwnerInverseMatrix.copy(this.owner.matrixWorld).invert();
+    this.computeOverlay.matrix.compose(
+      this.computeOverlayPosition,
+      this.computeOverlayQuaternion,
+      this.computeOverlayScale,
+    );
+    this.computeOverlay.matrix.premultiply(this.computeOwnerInverseMatrix);
+    this.computeOverlay.matrix.decompose(
+      this.computeOverlay.position,
+      this.computeOverlay.quaternion,
+      this.computeOverlay.scale,
+    );
+    this.computeOverlay.matrixWorldNeedsUpdate = true;
+  }
+
+  private syncGpuTilePath(
+    clusteredActiveClusters: ReadonlyArray<SplatMeshSelection['activeClusters'][number]>,
+    clusterSamplingStride: ReadonlyMap<number, number>,
+    tileBinning: SplatClusterTileBinningSnapshot,
+  ): void {
+    const asset = this.owner.getAsset();
+    let instanceCount = 0;
+
+    for (const activeCluster of clusteredActiveClusters) {
+      const page = asset.pages[activeCluster.pageId]!;
+      const samplingStride = clusterSamplingStride.get(activeCluster.clusterId) ?? 1;
+      instanceCount += Math.ceil(page.splatCount / samplingStride);
+    }
+
+    this.ensureGpuSelectionCapacity(instanceCount);
+    this.ensureGpuSprite();
+
+    const selectionArray = this.gpuSelectionArray;
+    let cursor = 0;
+
+    for (const activeCluster of clusteredActiveClusters) {
+      const cluster = asset.clusters[activeCluster.clusterId]!;
+      const page = asset.pages[activeCluster.pageId]!;
+      const samplingStride = clusterSamplingStride.get(cluster.id) ?? 1;
+      const densityCompensation = this.resolveDensityCompensation(samplingStride);
+      const scaleMultiplier = this.resolveCoverageScaleBoost(cluster, densityCompensation);
+      const pageDescriptorOffset = page.id * 8;
+      const pageSplatOffset = asset.buffers.pageDescriptors[pageDescriptorOffset + 6] ?? 0;
+
+      for (let splatIndex = 0; splatIndex < page.splatCount; splatIndex += samplingStride) {
+        const offset = cursor * 4;
+        selectionArray[offset + 0] = pageSplatOffset + splatIndex;
+        selectionArray[offset + 1] = cluster.id;
+        selectionArray[offset + 2] = scaleMultiplier;
+        selectionArray[offset + 3] = 0;
+        cursor += 1;
+      }
+    }
+
+    if (this.gpuSelectionAttribute) {
+      this.gpuSelectionAttribute.needsUpdate = true;
+      this.gpuSelectionAttribute.clearUpdateRanges();
+      this.gpuSelectionAttribute.addUpdateRange(0, cursor * 4);
+    }
+
+    this.syncGpuSprite(cursor);
+    this.snapshot = this.buildSnapshot(cursor, tileBinning);
+  }
+
+  private ensureGpuSelectionCapacity(requiredCapacity: number): void {
+    if (this.gpuSelectionArray.length >= requiredCapacity * 4) {
+      return;
+    }
+
+    const nextCapacity = this.resolveCapacity(
+      Math.floor(this.gpuSelectionArray.length / 4),
+      requiredCapacity,
+      256,
+    );
+    this.gpuSelectionArray = new Float32Array(nextCapacity * 4);
+    this.gpuSelectionAttribute = this.createStorageAttribute(this.gpuSelectionArray, 4, true);
+
+    if (this.gpuSprite) {
+      this.owner.remove(this.gpuSprite);
+      this.gpuSprite = undefined;
+      this.gpuMaterial = undefined;
+      this.gpuMaterialVersion = -1;
+    }
+  }
+
+  private ensureGpuSprite(): void {
+    if (
+      this.gpuSprite
+      && this.gpuMaterial
+      && this.gpuSelectionAttribute
+      && this.gpuPackedPositionsOpacityAttribute
+      && this.gpuPackedScalesAttribute
+      && this.gpuPackedRotationsAttribute
+      && this.gpuPackedColorsAttribute
+      && this.gpuMaterialVersion === this.owner.getMaterialVersion()
+    ) {
+      return;
+    }
+
+    if (this.gpuSprite) {
+      this.owner.remove(this.gpuSprite);
+      this.gpuSprite = undefined;
+      this.gpuMaterial = undefined;
+    }
+
+    this.ensurePackedSplatStorageAttributes();
+    this.gpuSelectionAttribute ??= this.createStorageAttribute(this.gpuSelectionArray, 4, true);
+    this.gpuMaterial = this.createGpuMaterial(
+      this.gpuSelectionAttribute,
+      this.gpuPackedPositionsOpacityAttribute!,
+      this.gpuPackedScalesAttribute!,
+      this.gpuPackedRotationsAttribute!,
+      this.gpuPackedColorsAttribute!,
+    );
+    this.gpuMaterialVersion = this.owner.getMaterialVersion();
+    this.gpuSprite = new Sprite(this.gpuMaterial);
+    this.gpuSprite.count = 0;
+    this.gpuSprite.frustumCulled = false;
+    this.gpuSprite.renderOrder = 21;
+    this.gpuSprite.name = 'SparkGpuTileSpriteQueue';
+    this.owner.add(this.gpuSprite);
+  }
+
+  private createGpuMaterial(
+    selectionAttribute: StorageInstancedBufferAttribute,
+    positionsOpacityAttribute: StorageInstancedBufferAttribute,
+    scalesAttribute: StorageInstancedBufferAttribute,
+    rotationsAttribute: StorageInstancedBufferAttribute,
+    colorsAttribute: StorageInstancedBufferAttribute,
+  ): SpriteNodeMaterial {
+    const material = new SpriteNodeMaterial();
+    const uvNode = uv();
+    const centeredUv = uvNode.sub(vec2(0.5)).mul(2.0);
+    const radial = lengthSq(centeredUv);
+    const feather = smoothstep(1.0, 0.5, radial);
+    const selectionNode = storage(selectionAttribute, 'vec4', Math.max(1, Math.floor(selectionAttribute.array.length / 4)));
+    const positionsNode = storage(positionsOpacityAttribute, 'vec4', Math.max(1, Math.floor(positionsOpacityAttribute.array.length / 4)));
+    const scalesNode = storage(scalesAttribute, 'vec4', Math.max(1, Math.floor(scalesAttribute.array.length / 4)));
+    const rotationsNode = storage(rotationsAttribute, 'vec4', Math.max(1, Math.floor(rotationsAttribute.array.length / 4)));
+    const colorsNode = storage(colorsAttribute, 'vec4', Math.max(1, Math.floor(colorsAttribute.array.length / 4)));
+    const selectionEntry = selectionNode.element(instanceIndex);
+    const splatIndex = uint(selectionEntry.x);
+    const sourcePosition = positionsNode.element(splatIndex);
+    const sourceScale = scalesNode.element(splatIndex);
+    const sourceRotation = rotationsNode.element(splatIndex);
+    const sourceColor = colorsNode.element(splatIndex);
+    const alphaNode = sourcePosition.w.mul(float(this.owner.splatMaterial.opacity)).mul(exp(radial.mul(-10.5))).mul(feather);
+    const scaledAxes = sourceScale.xyz.mul(selectionEntry.z).mul(float(this.owner.splatMaterial.pointSize * 0.64));
+    const quaternionXYZ = sourceRotation.xyz;
+    const quaternionW = sourceRotation.w;
+    const rotateAxis = (axisNode: any) => {
+      const doubleCross = cross(quaternionXYZ, axisNode).mul(2);
+      return axisNode.add(doubleCross.mul(quaternionW)).add(cross(quaternionXYZ, doubleCross));
+    };
+    const axisXView = modelViewMatrix.mul(vec4(rotateAxis(vec3(scaledAxes.x, 0, 0)), 0)).xyz;
+    const axisYView = modelViewMatrix.mul(vec4(rotateAxis(vec3(0, scaledAxes.y, 0)), 0)).xyz;
+    const axisZView = modelViewMatrix.mul(vec4(rotateAxis(vec3(0, 0, scaledAxes.z)), 0)).xyz;
+    const covarianceXX = axisXView.x.mul(axisXView.x).add(axisYView.x.mul(axisYView.x)).add(axisZView.x.mul(axisZView.x));
+    const covarianceXY = axisXView.x.mul(axisXView.y).add(axisYView.x.mul(axisYView.y)).add(axisZView.x.mul(axisZView.y));
+    const covarianceYY = axisXView.y.mul(axisXView.y).add(axisYView.y.mul(axisYView.y)).add(axisZView.y.mul(axisZView.y));
+    const trace = covarianceXX.add(covarianceYY);
+    const delta = sqrt(max(0.000001, covarianceXX.sub(covarianceYY).mul(covarianceXX.sub(covarianceYY)).add(covarianceXY.mul(covarianceXY).mul(4))));
+    const majorScale = sqrt(max(0.000016, trace.add(delta).mul(0.5)));
+    const minorScale = sqrt(max(0.000004, trace.sub(delta).mul(0.5)));
+    const ellipseRotation = atan(covarianceXY.mul(2), covarianceXX.sub(covarianceYY)).mul(0.5);
+
+    material.positionNode = sourcePosition.xyz;
+    material.scaleNode = vec2(majorScale, minorScale);
+    material.rotationNode = ellipseRotation;
+    material.colorNode = sourceColor.xyz
+      .mul(vec3(
+        this.owner.splatMaterial.tint.r * this.owner.splatMaterial.colorGain,
+        this.owner.splatMaterial.tint.g * this.owner.splatMaterial.colorGain,
+        this.owner.splatMaterial.tint.b * this.owner.splatMaterial.colorGain,
+      ))
+      .mul(alphaNode);
+    material.opacityNode = alphaNode;
+    material.maskNode = radial.lessThan(1.0);
+    material.transparent = true;
+    material.depthWrite = false;
+    material.sizeAttenuation = true;
+    material.side = DoubleSide;
+    material.blending = NormalBlending;
+    material.premultipliedAlpha = true;
+
+    return material;
+  }
+
+  private syncGpuSprite(instanceCount: number): void {
+    if (!this.gpuSprite) {
+      return;
+    }
+
+    this.gpuSprite.count = instanceCount;
+    this.gpuSprite.visible = instanceCount > 0;
   }
 
   private buildSnapshot(
     instanceCount: number,
     tileBinning: SplatClusterTileBinningSnapshot,
+    overrides: {
+      tileWorkPeak?: number;
+      tileBufferBytes?: number;
+    } = {},
   ): SplatCompositorSnapshot {
     return {
       weightedInstances: instanceCount,
@@ -443,17 +1340,19 @@ export class SplatSpriteCompositor {
       weightedTiles: tileBinning.activeTiles,
       depthSlicedTiles: 0,
       heroTiles: 0,
-      maxTileComplexity: tileBinning.maxTileSplatEstimate,
+      maxTileComplexity: overrides.tileWorkPeak ?? tileBinning.maxTileSplatEstimate,
       visibleClusters: tileBinning.visibleClusterCount,
       binnedClusters: tileBinning.binnedClusterCount,
       binnedClusterReferences: tileBinning.binnedClusterReferences,
       overflowedTiles: tileBinning.overflowedTiles,
       overflowedClusterReferences: tileBinning.overflowedClusterReferences,
       maxClustersPerTile: tileBinning.maxTileClusterCount,
-      maxTileSplatEstimate: tileBinning.maxTileSplatEstimate,
-      tileBufferBytes: tileBinning.buffers.clusterScreenData.byteLength
+      maxTileSplatEstimate: overrides.tileWorkPeak ?? tileBinning.maxTileSplatEstimate,
+      tileBufferBytes: overrides.tileBufferBytes ?? (
+        tileBinning.buffers.clusterScreenData.byteLength
         + tileBinning.buffers.tileHeaders.byteLength
-        + tileBinning.buffers.tileEntries.byteLength,
+        + tileBinning.buffers.tileEntries.byteLength
+      ),
     };
   }
 
@@ -461,6 +1360,7 @@ export class SplatSpriteCompositor {
     tileBinning: SplatClusterTileBinningSnapshot,
     budgets: SplatBudgetOptions,
   ): Map<number, number> {
+    const targetStride = new Map<number, number>();
     const clusterStride = new Map<number, number>();
     let reductionHash = 2166136261;
 
@@ -477,14 +1377,52 @@ export class SplatSpriteCompositor {
       }
 
       for (const clusterId of tile.clusterIds) {
+        const projectedCluster = tileBinning.clusterProjections.get(clusterId);
+
+        if (projectedCluster) {
+          const closeCluster = projectedCluster.screenRadius >= 18;
+          const leafCluster = projectedCluster.representedSplatCount <= projectedCluster.splatCount * 1.05;
+
+          if (closeCluster || leafCluster) {
+            targetStride.set(clusterId, 1);
+            continue;
+          }
+        }
+
         const nextStride = Math.max(
-          clusterStride.get(clusterId) ?? 1,
-          Math.min(8, Math.ceil(reductionFactor)),
+          targetStride.get(clusterId) ?? 1,
+          Math.min(COMPUTE_MAX_SAMPLING_STRIDE, Math.ceil(reductionFactor)),
         );
-        clusterStride.set(clusterId, nextStride);
-        reductionHash = Math.imul(reductionHash ^ clusterId, 16777619) >>> 0;
-        reductionHash = Math.imul(reductionHash ^ nextStride, 16777619) >>> 0;
+        targetStride.set(clusterId, nextStride);
       }
+    }
+
+    const activeClusterIds = new Set(tileBinning.clusterOrder);
+
+    for (const clusterId of activeClusterIds) {
+      const previousStride = this.stableClusterSamplingStride.get(clusterId) ?? 1;
+      const desiredStride = targetStride.get(clusterId) ?? 1;
+      let resolvedStride = desiredStride;
+
+      if (desiredStride < previousStride) {
+        resolvedStride = desiredStride <= previousStride - 2
+          ? previousStride - 1
+          : previousStride;
+      }
+
+      resolvedStride = Math.max(1, Math.min(COMPUTE_MAX_SAMPLING_STRIDE, resolvedStride));
+      clusterStride.set(clusterId, resolvedStride);
+      this.stableClusterSamplingStride.set(clusterId, resolvedStride);
+      reductionHash = Math.imul(reductionHash ^ clusterId, 16777619) >>> 0;
+      reductionHash = Math.imul(reductionHash ^ resolvedStride, 16777619) >>> 0;
+    }
+
+    for (const clusterId of [...this.stableClusterSamplingStride.keys()]) {
+      if (activeClusterIds.has(clusterId)) {
+        continue;
+      }
+
+      this.stableClusterSamplingStride.delete(clusterId);
     }
 
     this.lastReductionHash = reductionHash;
@@ -861,6 +1799,32 @@ export class SplatSpriteCompositor {
     multiplier = 1,
   ): number {
     return Math.max(0.012, scale * this.owner.splatMaterial.pointSize * 0.64 * multiplier);
+  }
+
+  private resolveMaxProjectedClusterRadius(tileBinning: SplatClusterTileBinningSnapshot): number {
+    let maxRadius = 0;
+
+    for (const projection of tileBinning.clusterProjections.values()) {
+      maxRadius = Math.max(maxRadius, projection.screenRadius);
+    }
+
+    return maxRadius;
+  }
+
+  private resolveCameraNear(camera: Camera): number {
+    if (camera instanceof PerspectiveCamera || camera instanceof OrthographicCamera) {
+      return camera.near;
+    }
+
+    return 0.01;
+  }
+
+  private resolveCameraFar(camera: Camera): number {
+    if (camera instanceof PerspectiveCamera || camera instanceof OrthographicCamera) {
+      return camera.far;
+    }
+
+    return 10_000;
   }
 
 }

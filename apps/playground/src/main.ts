@@ -69,7 +69,7 @@ const COMPLEX_SPLAT_PRESET: PlaygroundComplexSplatPreset = {
   peripheralFoveation: 2.2,
   heroTiles: 0,
   temporalStabilityBias: 1.2,
-  pointSize: 15.15,
+  pointSize: 5.15,
   opacity: 1,
   colorGain: 1.23,
   targetFrameMs: 32,

@@ -29,6 +29,7 @@ import type { SplatBudgetOptions } from '../core/budgets';
 import type { SplatSceneObjectDescriptor } from '../core/scene-descriptor';
 
 export interface SplatGpuRendererLike {
+  compute?: (...args: any[]) => Promise<unknown> | unknown;
   computeAsync?: (...args: any[]) => Promise<unknown>;
   getArrayBufferAsync?: (attribute: BufferAttribute) => Promise<ArrayBuffer>;
   hasInitialized?: () => boolean;
