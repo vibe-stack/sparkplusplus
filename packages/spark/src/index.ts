@@ -2,6 +2,7 @@ export * from './assets/model';
 export * from './assets/page-table';
 export * from './assets/procedural-source';
 export * from './assets/spz-source';
+export * from './compositor/cluster-tile-binner';
 export * from './compositor/sprite-compositor';
 export * from './compositor/tile-classifier';
 export * from './core/budgets';

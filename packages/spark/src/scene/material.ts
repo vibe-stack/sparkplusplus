@@ -1,6 +1,13 @@
 import { Color, type ColorRepresentation } from 'three';
 
-export type SplatDebugMode = 'albedo' | 'lod' | 'semantic';
+export type SplatDebugMode =
+  | 'albedo'
+  | 'lod'
+  | 'semantic'
+  | 'tile-occupancy'
+  | 'tile-heatmap'
+  | 'depth-buckets'
+  | 'cluster-bounds';
 
 export interface SplatMaterialOptions {
   pointSize?: number;

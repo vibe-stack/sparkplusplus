@@ -12,6 +12,11 @@ export interface SplatBudgetOptions {
   deformationBudget: number;
   renderScale: number;
   temporalStabilityBias: number;
+  tileSizePx: number;
+  maxClustersPerTile: number;
+  tileDepthBucketCount: number;
+  clusterTilePadding: number;
+  maxSplatsPerTile: number;
 }
 
 export const DEFAULT_SPLAT_BUDGETS: SplatBudgetOptions = {
@@ -28,6 +33,11 @@ export const DEFAULT_SPLAT_BUDGETS: SplatBudgetOptions = {
   deformationBudget: 1,
   renderScale: 1,
   temporalStabilityBias: 1.3,
+  tileSizePx: 24,
+  maxClustersPerTile: 32,
+  tileDepthBucketCount: 6,
+  clusterTilePadding: 0,
+  maxSplatsPerTile: 768,
 };
 
 export function cloneBudgets(

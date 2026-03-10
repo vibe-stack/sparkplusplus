@@ -4,8 +4,10 @@ export type SplatFramePassName =
   | 'cluster-cull-score'
   | 'lod-frontier-selection'
   | 'residency-request-emission'
-  | 'active-page-expansion'
-  | 'tile-compositor-sync';
+  | 'cluster-visible-list-compaction'
+  | 'cluster-tile-binning'
+  | 'tile-local-splat-expansion'
+  | 'tile-local-depth-composite';
 
 export interface SplatFramePassDescriptor {
   name: SplatFramePassName;
@@ -46,15 +48,27 @@ export const SPARK_FRAME_GRAPH: readonly SplatFramePassDescriptor[] = [
     outputs: ['requested page queue', 'resident page set'],
   },
   {
-    name: 'active-page-expansion',
+    name: 'cluster-visible-list-compaction',
     stage: 'cpu-bootstrap',
     inputs: ['resident pages', 'active frontier clusters'],
-    outputs: ['active page list', 'renderable splat count'],
+    outputs: ['visible cluster list', 'compatible page indirection'],
   },
   {
-    name: 'tile-compositor-sync',
+    name: 'cluster-tile-binning',
     stage: 'tile-compositor',
-    inputs: ['active page list', 'material/effect stack'],
-    outputs: ['sprite tile queues', 'weighted/hero compositor instances'],
+    inputs: ['visible cluster list', 'camera/viewport'],
+    outputs: ['cluster screen bounds', 'tile headers', 'tile cluster entries'],
+  },
+  {
+    name: 'tile-local-splat-expansion',
+    stage: 'tile-compositor',
+    inputs: ['tile cluster entries', 'resident pages', 'material/effect stack'],
+    outputs: ['tile-local splat work queues', 'compatibility sprite instances'],
+  },
+  {
+    name: 'tile-local-depth-composite',
+    stage: 'tile-compositor',
+    inputs: ['tile-local splat work queues', 'depth buckets'],
+    outputs: ['weighted/hero compositor instances', 'tile debug telemetry'],
   },
 ] as const;

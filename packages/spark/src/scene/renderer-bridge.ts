@@ -110,6 +110,14 @@ export class SplatRendererBridge extends Object3D {
     let compositorDepthSlicedTiles = 0;
     let compositorHeroTiles = 0;
     let compositorMaxTileComplexity = 0;
+    let compositorVisibleClusters = 0;
+    let compositorBinnedClusters = 0;
+    let compositorBinnedClusterReferences = 0;
+    let compositorOverflowedTiles = 0;
+    let compositorOverflowedClusterReferences = 0;
+    let compositorMaxClustersPerTile = 0;
+    let compositorMaxTileSplatEstimate = 0;
+    let compositorTileBufferBytes = 0;
 
     for (const descriptor of sceneDescriptors.objects) {
       const mesh = descriptor.mesh;
@@ -146,6 +154,14 @@ export class SplatRendererBridge extends Object3D {
       compositorDepthSlicedTiles += compositor.depthSlicedTiles;
       compositorHeroTiles += compositor.heroTiles;
       compositorMaxTileComplexity = Math.max(compositorMaxTileComplexity, compositor.maxTileComplexity);
+      compositorVisibleClusters += compositor.visibleClusters;
+      compositorBinnedClusters += compositor.binnedClusters;
+      compositorBinnedClusterReferences += compositor.binnedClusterReferences;
+      compositorOverflowedTiles += compositor.overflowedTiles;
+      compositorOverflowedClusterReferences += compositor.overflowedClusterReferences;
+      compositorMaxClustersPerTile = Math.max(compositorMaxClustersPerTile, compositor.maxClustersPerTile);
+      compositorMaxTileSplatEstimate = Math.max(compositorMaxTileSplatEstimate, compositor.maxTileSplatEstimate);
+      compositorTileBufferBytes += compositor.tileBufferBytes;
 
       meshStats.push({
         meshUuid: mesh.uuid,
@@ -165,6 +181,14 @@ export class SplatRendererBridge extends Object3D {
         depthSlicedTiles: compositor.depthSlicedTiles,
         heroTiles: compositor.heroTiles,
         maxTileComplexity: compositor.maxTileComplexity,
+        visibleClusters: compositor.visibleClusters,
+        binnedClusters: compositor.binnedClusters,
+        binnedClusterReferences: compositor.binnedClusterReferences,
+        overflowedTiles: compositor.overflowedTiles,
+        overflowedClusterReferences: compositor.overflowedClusterReferences,
+        maxClustersPerTile: compositor.maxClustersPerTile,
+        maxTileSplatEstimate: compositor.maxTileSplatEstimate,
+        tileBufferBytes: compositor.tileBufferBytes,
       });
     }
 
@@ -208,6 +232,14 @@ export class SplatRendererBridge extends Object3D {
       compositorDepthSlicedTiles,
       compositorHeroTiles,
       compositorMaxTileComplexity,
+      compositorVisibleClusters,
+      compositorBinnedClusters,
+      compositorBinnedClusterReferences,
+      compositorOverflowedTiles,
+      compositorOverflowedClusterReferences,
+      compositorMaxClustersPerTile,
+      compositorMaxTileSplatEstimate,
+      compositorTileBufferBytes,
       cpuFrameMs: performance.now() - frameStart,
       sceneBuildMs,
       schedulerMs,

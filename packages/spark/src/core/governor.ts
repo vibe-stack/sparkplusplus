@@ -110,31 +110,38 @@ export class SplatQualityGovernor {
 
     if (level >= 1) {
       budgets.heroTileBudget = Math.max(0, budgets.heroTileBudget - 1);
+      budgets.tileDepthBucketCount = Math.max(4, budgets.tileDepthBucketCount - 1);
     }
 
     if (level >= 2) {
       budgets.peripheralFoveation = 1.35;
+      budgets.tileSizePx = Math.round(budgets.tileSizePx * 1.15);
+      budgets.maxClustersPerTile = Math.max(16, Math.round(budgets.maxClustersPerTile * 0.82));
     }
 
     if (level >= 3) {
       budgets.deformationBudget = 0;
       budgets.maxDeformablePages = Math.max(0, budgets.maxDeformablePages - 2);
+      budgets.maxSplatsPerTile = Math.max(384, Math.round(budgets.maxSplatsPerTile * 0.82));
     }
 
     if (level >= 4) {
       budgets.effectUpdateCadence = 2;
       budgets.maxOverdrawBudget = Math.round(budgets.maxOverdrawBudget * 0.82);
       budgets.maxPageUploadsPerFrame = Math.max(2, Math.round(budgets.maxPageUploadsPerFrame * 0.75));
+      budgets.tileSizePx = Math.round(budgets.tileSizePx * 1.12);
     }
 
     if (level >= 5) {
       budgets.maxVisibleSplats = Math.round(budgets.maxVisibleSplats * 0.82);
       budgets.maxActivePages = Math.max(12, Math.round(budgets.maxActivePages * 0.78));
+      budgets.maxSplatsPerTile = Math.max(256, Math.round(budgets.maxSplatsPerTile * 0.78));
     }
 
     if (level >= 6) {
       budgets.minProjectedNodeSizePx = Math.round(budgets.minProjectedNodeSizePx * 1.25);
       budgets.maxResidentPages = Math.max(16, Math.round(budgets.maxResidentPages * 0.75));
+      budgets.tileDepthBucketCount = Math.max(3, budgets.tileDepthBucketCount - 1);
     }
 
     return budgets;

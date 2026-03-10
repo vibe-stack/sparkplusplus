@@ -1,11 +1,14 @@
 import {
   AdditiveBlending,
+  BufferAttribute,
+  BufferGeometry,
   Color,
   DoubleSide,
   DynamicDrawUsage,
   InstancedBufferAttribute,
+  LineBasicMaterial,
+  LineSegments,
   Sprite,
-  Vector3,
 } from 'three';
 import { SpriteNodeMaterial } from 'three/webgpu';
 import {
@@ -24,6 +27,11 @@ import {
 } from 'three/tsl';
 import type { Camera } from 'three';
 import { lengthSq } from 'three/tsl';
+import {
+  SplatClusterTileBinner,
+  type SplatClusterTileBinningSnapshot,
+  type SplatProjectedCluster,
+} from './cluster-tile-binner';
 import { SPLAT_SEMANTIC_FLAGS } from '../core/semantics';
 import type { SplatBudgetOptions } from '../core/budgets';
 import type { SplatMeshSelection } from '../scheduler/bootstrap-scheduler';
@@ -38,6 +46,14 @@ export interface SplatCompositorSnapshot {
   depthSlicedTiles: number;
   heroTiles: number;
   maxTileComplexity: number;
+  visibleClusters: number;
+  binnedClusters: number;
+  binnedClusterReferences: number;
+  overflowedTiles: number;
+  overflowedClusterReferences: number;
+  maxClustersPerTile: number;
+  maxTileSplatEstimate: number;
+  tileBufferBytes: number;
 }
 
 export interface SplatCompositorFrameContext {
@@ -59,6 +75,14 @@ const EMPTY_SNAPSHOT: SplatCompositorSnapshot = {
   depthSlicedTiles: 0,
   heroTiles: 0,
   maxTileComplexity: 0,
+  visibleClusters: 0,
+  binnedClusters: 0,
+  binnedClusterReferences: 0,
+  overflowedTiles: 0,
+  overflowedClusterReferences: 0,
+  maxClustersPerTile: 0,
+  maxTileSplatEstimate: 0,
+  tileBufferBytes: 0,
 };
 
 interface PreparedPageCache {
@@ -71,6 +95,7 @@ interface PreparedPageCache {
 
 export class SplatSpriteCompositor {
   private readonly preparedPageCache = new Map<number, PreparedPageCache>();
+  private readonly tileBinner = new SplatClusterTileBinner();
 
   private sprite?: Sprite;
   private material?: SpriteNodeMaterial;
@@ -79,18 +104,26 @@ export class SplatSpriteCompositor {
   private rotationAttribute?: InstancedBufferAttribute;
   private colorAttribute?: InstancedBufferAttribute;
   private opacityAttribute?: InstancedBufferAttribute;
+  private clusterBoundsOverlay?: LineSegments;
+  private clusterBoundsGeometry?: BufferGeometry;
+  private clusterBoundsMaterial?: LineBasicMaterial;
+  private clusterBoundsPositionAttribute?: BufferAttribute;
+  private clusterBoundsColorAttribute?: BufferAttribute;
 
   private positionArray = new Float32Array(0);
   private scaleArray = new Float32Array(0);
   private rotationArray = new Float32Array(0);
   private colorArray = new Float32Array(0);
   private opacityArray = new Float32Array(0);
+  private clusterBoundsPositionArray = new Float32Array(0);
+  private clusterBoundsColorArray = new Float32Array(0);
 
   private readonly colorScratch = new Color();
   private readonly effectTintScratch = new Color();
-  private readonly clusterPositionScratch = new Vector3();
+  private readonly debugColorScratch = new Color();
   private snapshot: SplatCompositorSnapshot = EMPTY_SNAPSHOT;
   private lastBuildSignature = '';
+  private lastReductionHash = 2166136261;
 
   constructor(private readonly owner: SplatMesh) {
     this.ensureCapacity(256);
@@ -103,23 +136,45 @@ export class SplatSpriteCompositor {
   sync(selection: SplatMeshSelection, context: SplatCompositorFrameContext): void {
     const asset = this.owner.getAsset();
     const canUsePreparedPages = this.canUsePreparedPages();
-    const sortedActiveClusters = [...selection.activeClusters].sort((left, right) =>
-      this.getClusterCameraDepth(asset.clusters[left.clusterId]!, context.camera)
-      - this.getClusterCameraDepth(asset.clusters[right.clusterId]!, context.camera),
+    // Phase 1 compatibility path:
+    // 1. Project visible clusters into fixed-size screen tiles.
+    // 2. Build bounded per-tile cluster lists plus depth buckets.
+    // 3. Feed the existing sprite queue from tile-informed cluster order.
+    const tileBinning = this.tileBinner.binVisibleClusters(
+      this.owner,
+      selection.activeClusters,
+      context.camera,
+      context.viewportWidth,
+      context.viewportHeight,
+      context.budgets,
     );
+    const activeClusterById = new Map(
+      selection.activeClusters.map((activeCluster) => [activeCluster.clusterId, activeCluster] as const),
+    );
+    const clusteredActiveClusters = tileBinning.clusterOrder
+      .map((clusterId) => activeClusterById.get(clusterId))
+      .filter((cluster): cluster is NonNullable<typeof cluster> => cluster !== undefined);
+    const clusterSamplingStride = this.resolveClusterSamplingStride(tileBinning, context.budgets);
     const frameBucket = this.owner.effectStack.hasTemporalEffects()
       ? Math.floor(context.frameIndex / Math.max(1, context.budgets.effectUpdateCadence))
       : 0;
+    const rebuildDependsOnBinning = this.owner.splatMaterial.debugMode === 'tile-occupancy'
+      || this.owner.splatMaterial.debugMode === 'tile-heatmap'
+      || this.owner.splatMaterial.debugMode === 'depth-buckets';
     const buildSignature = [
-      sortedActiveClusters.map((cluster) => cluster.clusterId).join(','),
+      clusteredActiveClusters.map((cluster) => cluster.clusterId).join(','),
       this.owner.getMaterialVersion(),
       this.owner.getEffectVersion(),
       frameBucket,
+      rebuildDependsOnBinning ? tileBinning.debugHash : 'static',
+      this.lastReductionHash,
     ].join('::');
 
-    if (sortedActiveClusters.length === 0) {
+    this.syncClusterBoundsOverlay(tileBinning);
+    this.snapshot = this.buildSnapshot(0, tileBinning);
+
+    if (clusteredActiveClusters.length === 0) {
       this.lastBuildSignature = '';
-      this.snapshot = EMPTY_SNAPSHOT;
       this.syncSprite(0);
       return;
     }
@@ -132,21 +187,26 @@ export class SplatSpriteCompositor {
 
     let queueEstimate = 0;
 
-    for (const activeCluster of sortedActiveClusters) {
-      queueEstimate += asset.pages[activeCluster.pageId]!.splatCount;
+    for (const activeCluster of clusteredActiveClusters) {
+      const page = asset.pages[activeCluster.pageId]!;
+      const samplingStride = clusterSamplingStride.get(activeCluster.clusterId) ?? 1;
+      queueEstimate += Math.ceil(page.splatCount / samplingStride);
     }
 
     this.ensureCapacity(queueEstimate);
 
     let instanceCount = 0;
 
-    for (const activeCluster of sortedActiveClusters) {
+    for (const activeCluster of clusteredActiveClusters) {
       const cluster = asset.clusters[activeCluster.clusterId]!;
       const page = asset.pages[activeCluster.pageId]!;
       const preparedPage = canUsePreparedPages ? this.getPreparedPageCache(page) : null;
-      const coverageScaleBoost = this.resolveCoverageScaleBoost(cluster);
+      const projectedCluster = tileBinning.clusterProjections.get(cluster.id) ?? null;
+      const samplingStride = clusterSamplingStride.get(cluster.id) ?? 1;
+      const densityCompensation = this.resolveDensityCompensation(samplingStride);
+      const coverageScaleBoost = this.resolveCoverageScaleBoost(cluster, densityCompensation);
 
-      if (preparedPage) {
+      if (preparedPage && samplingStride === 1) {
         this.copyPreparedPage(
           page.positions,
           preparedPage.baseScales,
@@ -160,10 +220,21 @@ export class SplatSpriteCompositor {
         continue;
       }
 
+      if (preparedPage) {
+        instanceCount += this.copyPreparedPageStrided(
+          preparedPage,
+          page.positions,
+          instanceCount,
+          samplingStride,
+          coverageScaleBoost,
+        );
+        continue;
+      }
+
       const resolvedEffects = this.owner.effectStack.evaluate(cluster.semanticMask, context.timeSeconds);
       this.effectTintScratch.copy(resolvedEffects.tint);
 
-      for (let splatIndex = 0; splatIndex < page.splatCount; splatIndex += 1) {
+      for (let splatIndex = 0; splatIndex < page.splatCount; splatIndex += samplingStride) {
         const sourceOffset = splatIndex * 3;
         const rotationOffset = splatIndex * 4;
 
@@ -187,6 +258,14 @@ export class SplatSpriteCompositor {
           } else {
             this.colorScratch.set(0xf8fafc);
           }
+        }
+
+        if (
+          this.owner.splatMaterial.debugMode === 'tile-occupancy'
+          || this.owner.splatMaterial.debugMode === 'tile-heatmap'
+          || this.owner.splatMaterial.debugMode === 'depth-buckets'
+        ) {
+          this.resolveTileDebugColor(this.colorScratch, projectedCluster, tileBinning);
         }
 
         this.colorScratch
@@ -218,16 +297,7 @@ export class SplatSpriteCompositor {
 
     this.flushAttributes(instanceCount);
     this.syncSprite(instanceCount);
-    this.snapshot = {
-      weightedInstances: instanceCount,
-      heroInstances: 0,
-      depthSlicedInstances: 0,
-      activeTiles: 0,
-      weightedTiles: 0,
-      depthSlicedTiles: 0,
-      heroTiles: 0,
-      maxTileComplexity: 0,
-    };
+    this.snapshot = this.buildSnapshot(instanceCount, tileBinning);
   }
 
   private ensureCapacity(requiredCapacity: number): void {
@@ -361,6 +431,253 @@ export class SplatSpriteCompositor {
     this.sprite.visible = instanceCount > 0;
   }
 
+  private buildSnapshot(
+    instanceCount: number,
+    tileBinning: SplatClusterTileBinningSnapshot,
+  ): SplatCompositorSnapshot {
+    return {
+      weightedInstances: instanceCount,
+      heroInstances: 0,
+      depthSlicedInstances: 0,
+      activeTiles: tileBinning.activeTiles,
+      weightedTiles: tileBinning.activeTiles,
+      depthSlicedTiles: 0,
+      heroTiles: 0,
+      maxTileComplexity: tileBinning.maxTileSplatEstimate,
+      visibleClusters: tileBinning.visibleClusterCount,
+      binnedClusters: tileBinning.binnedClusterCount,
+      binnedClusterReferences: tileBinning.binnedClusterReferences,
+      overflowedTiles: tileBinning.overflowedTiles,
+      overflowedClusterReferences: tileBinning.overflowedClusterReferences,
+      maxClustersPerTile: tileBinning.maxTileClusterCount,
+      maxTileSplatEstimate: tileBinning.maxTileSplatEstimate,
+      tileBufferBytes: tileBinning.buffers.clusterScreenData.byteLength
+        + tileBinning.buffers.tileHeaders.byteLength
+        + tileBinning.buffers.tileEntries.byteLength,
+    };
+  }
+
+  private resolveClusterSamplingStride(
+    tileBinning: SplatClusterTileBinningSnapshot,
+    budgets: SplatBudgetOptions,
+  ): Map<number, number> {
+    const clusterStride = new Map<number, number>();
+    let reductionHash = 2166136261;
+
+    for (const tile of tileBinning.tileBins) {
+      const clusterPressure = tile.clusterIds.length / Math.max(1, budgets.maxClustersPerTile);
+      const splatPressure = tile.splatEstimate / Math.max(1, budgets.maxSplatsPerTile);
+      const overflowPressure = tile.overflowCount > 0
+        ? 1 + tile.overflowCount / Math.max(1, budgets.maxClustersPerTile)
+        : 1;
+      const reductionFactor = Math.max(1, splatPressure, clusterPressure * 0.92, overflowPressure);
+
+      if (reductionFactor <= 1.05) {
+        continue;
+      }
+
+      for (const clusterId of tile.clusterIds) {
+        const nextStride = Math.max(
+          clusterStride.get(clusterId) ?? 1,
+          Math.min(8, Math.ceil(reductionFactor)),
+        );
+        clusterStride.set(clusterId, nextStride);
+        reductionHash = Math.imul(reductionHash ^ clusterId, 16777619) >>> 0;
+        reductionHash = Math.imul(reductionHash ^ nextStride, 16777619) >>> 0;
+      }
+    }
+
+    this.lastReductionHash = reductionHash;
+    return clusterStride;
+  }
+
+  private resolveTileDebugColor(
+    target: Color,
+    projectedCluster: SplatProjectedCluster | null,
+    tileBinning: SplatClusterTileBinningSnapshot,
+  ): void {
+    if (!projectedCluster) {
+      target.set(0xf8fafc);
+      return;
+    }
+
+    const headerOffset = projectedCluster.dominantTileId * 4;
+    const dominantTileClusterCount = tileBinning.buffers.tileHeaders[headerOffset + 1] ?? 0;
+    const dominantTileSplatEstimate = tileBinning.buffers.tileHeaders[headerOffset + 2] ?? 0;
+
+    if (this.owner.splatMaterial.debugMode === 'tile-occupancy') {
+      const occupancy = dominantTileClusterCount / Math.max(1, tileBinning.maxTileClusterCount);
+      target.setHSL(0.62 - occupancy * 0.62, 0.82, 0.58);
+      return;
+    }
+
+    if (this.owner.splatMaterial.debugMode === 'tile-heatmap') {
+      const heat = dominantTileSplatEstimate / Math.max(1, tileBinning.maxTileSplatEstimate);
+      target.setHSL(0.7 - heat * 0.7, 0.88, 0.56);
+      return;
+    }
+
+    const bucketMix = projectedCluster.depthBucket / Math.max(1, tileBinning.depthBucketCount - 1);
+    target.setHSL(0.75 - bucketMix * 0.55, 0.78, 0.6);
+  }
+
+  private syncClusterBoundsOverlay(tileBinning: SplatClusterTileBinningSnapshot): void {
+    if (this.owner.splatMaterial.debugMode !== 'cluster-bounds' || tileBinning.visibleClusterCount === 0) {
+      if (this.clusterBoundsOverlay) {
+        this.clusterBoundsOverlay.visible = false;
+      }
+      return;
+    }
+
+    this.ensureClusterBoundsOverlay();
+
+    const asset = this.owner.getAsset();
+    const visibleClusterIds = tileBinning.clusterOrder.filter((clusterId) => tileBinning.clusterProjections.has(clusterId));
+    this.ensureClusterBoundsCapacity(visibleClusterIds.length);
+
+    let vertexCursor = 0;
+
+    for (const clusterId of visibleClusterIds) {
+      const cluster = asset.clusters[clusterId]!;
+      const projection = tileBinning.clusterProjections.get(clusterId)!;
+      const occupancy = projection.tileCount / Math.max(1, tileBinning.maxTileClusterCount);
+      this.debugColorScratch.setHSL(
+        Math.min(0.85, cluster.level * 0.12 + 0.08),
+        0.72,
+        Math.min(0.72, 0.42 + occupancy * 0.18),
+      );
+      vertexCursor = this.writeAabbOutline(
+        vertexCursor,
+        cluster.boundsMin,
+        cluster.boundsMax,
+        this.debugColorScratch,
+      );
+    }
+
+    if (!this.clusterBoundsOverlay || !this.clusterBoundsGeometry) {
+      return;
+    }
+
+    this.clusterBoundsOverlay.visible = true;
+    this.clusterBoundsGeometry.setDrawRange(0, vertexCursor);
+
+    if (this.clusterBoundsPositionAttribute && this.clusterBoundsColorAttribute) {
+      this.clusterBoundsPositionAttribute.needsUpdate = true;
+      this.clusterBoundsColorAttribute.needsUpdate = true;
+    }
+  }
+
+  private ensureClusterBoundsOverlay(): void {
+    if (this.clusterBoundsOverlay && this.clusterBoundsGeometry && this.clusterBoundsMaterial) {
+      return;
+    }
+
+    this.clusterBoundsGeometry = new BufferGeometry();
+    this.clusterBoundsPositionAttribute = new BufferAttribute(this.clusterBoundsPositionArray, 3);
+    this.clusterBoundsColorAttribute = new BufferAttribute(this.clusterBoundsColorArray, 3);
+    this.clusterBoundsGeometry.setAttribute('position', this.clusterBoundsPositionAttribute);
+    this.clusterBoundsGeometry.setAttribute('color', this.clusterBoundsColorAttribute);
+    this.clusterBoundsMaterial = new LineBasicMaterial({
+      vertexColors: true,
+      transparent: true,
+      opacity: 0.82,
+      depthTest: false,
+      toneMapped: false,
+    });
+    this.clusterBoundsOverlay = new LineSegments(this.clusterBoundsGeometry, this.clusterBoundsMaterial);
+    this.clusterBoundsOverlay.frustumCulled = false;
+    this.clusterBoundsOverlay.renderOrder = 28;
+    this.clusterBoundsOverlay.visible = false;
+    this.clusterBoundsOverlay.name = 'SparkClusterBoundsOverlay';
+    this.owner.add(this.clusterBoundsOverlay);
+  }
+
+  private ensureClusterBoundsCapacity(clusterCount: number): void {
+    const requiredVertices = clusterCount * 24;
+
+    if (this.clusterBoundsPositionArray.length >= requiredVertices * 3) {
+      return;
+    }
+
+    const nextCapacity = this.resolveCapacity(
+      Math.floor(this.clusterBoundsPositionArray.length / 3 / 24),
+      clusterCount,
+      16,
+    ) * 24;
+
+    this.clusterBoundsPositionArray = new Float32Array(nextCapacity * 3);
+    this.clusterBoundsColorArray = new Float32Array(nextCapacity * 3);
+
+    if (!this.clusterBoundsGeometry) {
+      return;
+    }
+
+    this.clusterBoundsPositionAttribute = new BufferAttribute(this.clusterBoundsPositionArray, 3);
+    this.clusterBoundsColorAttribute = new BufferAttribute(this.clusterBoundsColorArray, 3);
+    this.clusterBoundsGeometry.setAttribute('position', this.clusterBoundsPositionAttribute);
+    this.clusterBoundsGeometry.setAttribute('color', this.clusterBoundsColorAttribute);
+  }
+
+  private writeAabbOutline(
+    vertexCursor: number,
+    boundsMin: readonly [number, number, number],
+    boundsMax: readonly [number, number, number],
+    color: Color,
+  ): number {
+    const minX = boundsMin[0];
+    const minY = boundsMin[1];
+    const minZ = boundsMin[2];
+    const maxX = boundsMax[0];
+    const maxY = boundsMax[1];
+    const maxZ = boundsMax[2];
+    const corners: Array<[number, number, number]> = [
+      [minX, minY, minZ],
+      [maxX, minY, minZ],
+      [maxX, maxY, minZ],
+      [minX, maxY, minZ],
+      [minX, minY, maxZ],
+      [maxX, minY, maxZ],
+      [maxX, maxY, maxZ],
+      [minX, maxY, maxZ],
+    ];
+    const edges: Array<[number, number]> = [
+      [0, 1],
+      [1, 2],
+      [2, 3],
+      [3, 0],
+      [4, 5],
+      [5, 6],
+      [6, 7],
+      [7, 4],
+      [0, 4],
+      [1, 5],
+      [2, 6],
+      [3, 7],
+    ];
+
+    for (const [startIndex, endIndex] of edges) {
+      vertexCursor = this.writeDebugVertex(vertexCursor, corners[startIndex]!, color);
+      vertexCursor = this.writeDebugVertex(vertexCursor, corners[endIndex]!, color);
+    }
+
+    return vertexCursor;
+  }
+
+  private writeDebugVertex(
+    vertexCursor: number,
+    position: readonly [number, number, number],
+    color: Color,
+  ): number {
+    const offset = vertexCursor * 3;
+    this.clusterBoundsPositionArray[offset + 0] = position[0];
+    this.clusterBoundsPositionArray[offset + 1] = position[1];
+    this.clusterBoundsPositionArray[offset + 2] = position[2];
+    this.clusterBoundsColorArray[offset + 0] = color.r;
+    this.clusterBoundsColorArray[offset + 1] = color.g;
+    this.clusterBoundsColorArray[offset + 2] = color.b;
+    return vertexCursor + 1;
+  }
+
   private writeInstance(
     index: number,
     x: number,
@@ -466,6 +783,45 @@ export class SplatSpriteCompositor {
     }
   }
 
+  private copyPreparedPageStrided(
+    preparedPage: PreparedPageCache,
+    sourcePositions: Float32Array,
+    targetInstanceOffset: number,
+    samplingStride: number,
+    scaleMultiplier: number,
+  ): number {
+    let written = 0;
+
+    for (let splatIndex = 0; splatIndex < preparedPage.opacities.length; splatIndex += samplingStride) {
+      const sourceOffset = splatIndex * 3;
+      const rotationOffset = splatIndex * 4;
+      const targetIndex = targetInstanceOffset + written;
+
+      this.writeInstance(
+        targetIndex,
+        sourcePositions[sourceOffset + 0]!,
+        sourcePositions[sourceOffset + 1]!,
+        sourcePositions[sourceOffset + 2]!,
+        preparedPage.baseScales[sourceOffset + 0]! * scaleMultiplier,
+        preparedPage.baseScales[sourceOffset + 1]! * scaleMultiplier,
+        preparedPage.baseScales[sourceOffset + 2]! * scaleMultiplier,
+        preparedPage.rotations[rotationOffset + 0]!,
+        preparedPage.rotations[rotationOffset + 1]!,
+        preparedPage.rotations[rotationOffset + 2]!,
+        preparedPage.rotations[rotationOffset + 3]!,
+        this.colorScratch.setRGB(
+          preparedPage.colors[sourceOffset + 0]!,
+          preparedPage.colors[sourceOffset + 1]!,
+          preparedPage.colors[sourceOffset + 2]!,
+        ),
+        preparedPage.opacities[splatIndex]!,
+      );
+      written += 1;
+    }
+
+    return written;
+  }
+
   private resolveCapacity(
     currentCapacity: number,
     requiredCapacity: number,
@@ -484,9 +840,20 @@ export class SplatSpriteCompositor {
 
   private resolveCoverageScaleBoost(
     cluster: ReturnType<SplatMesh['getAsset']>['clusters'][number],
+    densityCompensation = 1,
   ): number {
     const representationGap = cluster.representedSplatCount / Math.max(1, cluster.splatCount);
-    return Math.min(1.35, 1 + Math.log2(Math.max(1, representationGap)) * 0.05);
+    return Math.min(1.85, (1 + Math.log2(Math.max(1, representationGap)) * 0.05) * densityCompensation);
+  }
+
+  private resolveDensityCompensation(samplingStride: number): number {
+    if (samplingStride <= 1) {
+      return 1;
+    }
+
+    // Scale compensation keeps a strided cluster from turning visibly sparse
+    // before the hierarchy/proxy path takes over in later phases.
+    return Math.min(1.75, 1 + Math.log2(samplingStride) * 0.25);
   }
 
   private resolveBaseScale(
@@ -496,16 +863,6 @@ export class SplatSpriteCompositor {
     return Math.max(0.012, scale * this.owner.splatMaterial.pointSize * 0.64 * multiplier);
   }
 
-  private getClusterCameraDepth(
-    cluster: ReturnType<SplatMesh['getAsset']>['clusters'][number],
-    camera: Camera,
-  ): number {
-    return this.clusterPositionScratch
-      .set(cluster.center[0], cluster.center[1], cluster.center[2])
-      .applyMatrix4(this.owner.matrixWorld)
-      .applyMatrix4(camera.matrixWorldInverse)
-      .z;
-  }
 }
 
 export { SplatSpriteCompositor as SplatTileCompositor };

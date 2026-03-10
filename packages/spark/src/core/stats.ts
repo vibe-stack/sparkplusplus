@@ -20,6 +20,14 @@ export interface SplatMeshFrameStats {
   depthSlicedTiles: number;
   heroTiles: number;
   maxTileComplexity: number;
+  visibleClusters: number;
+  binnedClusters: number;
+  binnedClusterReferences: number;
+  overflowedTiles: number;
+  overflowedClusterReferences: number;
+  maxClustersPerTile: number;
+  maxTileSplatEstimate: number;
+  tileBufferBytes: number;
 }
 
 export interface SplatFrameStatsSnapshot {
@@ -56,6 +64,14 @@ export interface SplatFrameStatsSnapshot {
   compositorDepthSlicedTiles: number;
   compositorHeroTiles: number;
   compositorMaxTileComplexity: number;
+  compositorVisibleClusters: number;
+  compositorBinnedClusters: number;
+  compositorBinnedClusterReferences: number;
+  compositorOverflowedTiles: number;
+  compositorOverflowedClusterReferences: number;
+  compositorMaxClustersPerTile: number;
+  compositorMaxTileSplatEstimate: number;
+  compositorTileBufferBytes: number;
   cpuFrameMs: number;
   sceneBuildMs: number;
   schedulerMs: number;
@@ -82,6 +98,11 @@ export const EMPTY_SPLAT_FRAME_STATS: SplatFrameStatsSnapshot = {
     deformationBudget: 0,
     renderScale: 1,
     temporalStabilityBias: 0,
+    tileSizePx: 0,
+    maxClustersPerTile: 0,
+    tileDepthBucketCount: 0,
+    clusterTilePadding: 0,
+    maxSplatsPerTile: 0,
   },
   meshCount: 0,
   dirtyObjects: 0,
@@ -110,6 +131,14 @@ export const EMPTY_SPLAT_FRAME_STATS: SplatFrameStatsSnapshot = {
   compositorDepthSlicedTiles: 0,
   compositorHeroTiles: 0,
   compositorMaxTileComplexity: 0,
+  compositorVisibleClusters: 0,
+  compositorBinnedClusters: 0,
+  compositorBinnedClusterReferences: 0,
+  compositorOverflowedTiles: 0,
+  compositorOverflowedClusterReferences: 0,
+  compositorMaxClustersPerTile: 0,
+  compositorMaxTileSplatEstimate: 0,
+  compositorTileBufferBytes: 0,
   cpuFrameMs: 0,
   sceneBuildMs: 0,
   schedulerMs: 0,

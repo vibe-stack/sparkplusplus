@@ -49,3 +49,24 @@ body {
   height: 100%;
   padding: 24px;
 }
+
+.debug-hud {
+  position: fixed;
+  top: 16px;
+  left: 16px;
+  z-index: 10;
+  min-width: 180px;
+  max-width: min(280px, calc(100vw - 32px));
+  padding: 12px 14px;
+  border: 1px solid rgba(125, 211, 252, 0.24);
+  border-radius: 14px;
+  background:
+    linear-gradient(180deg, rgba(15, 23, 42, 0.9), rgba(8, 15, 30, 0.82));
+  box-shadow: 0 14px 42px rgba(2, 6, 23, 0.42);
+  color: #dbeafe;
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: pre-line;
+  pointer-events: none;
+  backdrop-filter: blur(14px);
+}

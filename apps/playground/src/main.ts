@@ -1,5 +1,6 @@
 import './style.css';
 import {
+  type SplatDebugMode,
   SplatMaterial,
   SplatMesh,
   SplatQualityGovernor,
@@ -81,19 +82,38 @@ const COMPLEX_SPLAT_PRESET: PlaygroundComplexSplatPreset = {
   lookHeightScale: 0.38,
 };
 
+const DEBUG_MODES: readonly SplatDebugMode[] = [
+  'albedo',
+  'lod',
+  'semantic',
+  'tile-occupancy',
+  'tile-heatmap',
+  'depth-buckets',
+  'cluster-bounds',
+];
+
 if (!app) {
   throw new Error('Missing #app root');
 }
 
-app.innerHTML = '<div id="viewport" class="viewport"></div>';
+app.innerHTML = `
+  <div id="viewport" class="viewport"></div>
+  <div id="debug-hud" class="debug-hud"></div>
+`;
 
 const viewportElement = app.querySelector<HTMLDivElement>('#viewport');
+const debugHudElement = app.querySelector<HTMLDivElement>('#debug-hud');
 
 if (!viewportElement) {
   throw new Error('Missing viewport root');
 }
 
+if (!debugHudElement) {
+  throw new Error('Missing debug HUD root');
+}
+
 const viewport: HTMLDivElement = viewportElement;
+const debugHud: HTMLDivElement = debugHudElement;
 
 function isEditableTarget(target: EventTarget | null): boolean {
   return target instanceof HTMLElement && (
@@ -222,6 +242,20 @@ async function bootstrap(): Promise<void> {
     ].includes(event.code)) {
       event.preventDefault();
       pressedKeys.add(event.code);
+      return;
+    }
+
+    const debugModeDigit = Number.parseInt(event.key, 10);
+
+    if (debugModeDigit >= 1 && debugModeDigit <= DEBUG_MODES.length) {
+      currentDebugModeIndex = debugModeDigit - 1;
+      applyDebugMode(DEBUG_MODES[currentDebugModeIndex]!);
+      return;
+    }
+
+    if (event.code === 'Backquote') {
+      currentDebugModeIndex = (currentDebugModeIndex + 1) % DEBUG_MODES.length;
+      applyDebugMode(DEBUG_MODES[currentDebugModeIndex]!);
     }
   });
 
@@ -264,6 +298,12 @@ async function bootstrap(): Promise<void> {
   });
   heroSplat.position.set(-assetCenter.x, -importedAsset.localBoundsMin[1], -assetCenter.z);
   splatScene.add(heroSplat);
+
+  let currentDebugModeIndex = DEBUG_MODES.indexOf(heroSplat.splatMaterial.debugMode);
+
+  const applyDebugMode = (mode: SplatDebugMode) => {
+    heroSplat.splatMaterial.update({ debugMode: mode });
+  };
 
   const bridge = new SplatRendererBridge({
     governor: new SplatQualityGovernor({
@@ -336,6 +376,17 @@ async function bootstrap(): Promise<void> {
     controls.update();
     const snapshot = bridge.update(splatScene, camera, deltaSeconds, renderer);
     applyRendererScale(snapshot.budgets.renderScale);
+    const meshSnapshot = snapshot.meshStats[0];
+    debugHud.textContent = [
+      `mode ${heroSplat.splatMaterial.debugMode}`,
+      `visible clusters ${meshSnapshot?.visibleClusters ?? 0}`,
+      `binned refs ${meshSnapshot?.binnedClusterReferences ?? 0}`,
+      `overflow tiles ${meshSnapshot?.overflowedTiles ?? 0}`,
+      `tile peak ${meshSnapshot?.maxTileSplatEstimate ?? 0}`,
+      `tile size ${snapshot.budgets.tileSizePx}px / tile cap ${snapshot.budgets.maxSplatsPerTile}`,
+      `tile bytes ${Math.round((meshSnapshot?.tileBufferBytes ?? 0) / 1024)} KB`,
+      'keys 1-7 or ` to cycle',
+    ].join('\n');
     postProcessing.render();
   });
 }
