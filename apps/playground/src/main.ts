@@ -36,7 +36,7 @@ interface PlaygroundComplexSplatPreset {
   activePages: number;
   residentPages: number;
   uploadsPerFrame: number;
-  coverageBiasPx: number;
+  minProjectedNodeSizePx: number;
   peripheralFoveation: number;
   heroTiles: number;
   temporalStabilityBias: number;
@@ -58,22 +58,22 @@ const COMPLEX_SPLAT_PRESET: PlaygroundComplexSplatPreset = {
   pageCapacity: 1_024,
   minLeafPoints: 512,
   branching: 8,
-  visibleBudget: 5_200_000,
-  overdrawBudget: 520_000,
-  activePages: 1_280,
-  residentPages: 2_560,
-  uploadsPerFrame: 320,
-  coverageBiasPx: 0.35,
-  peripheralFoveation: 1.6,
-  heroTiles: 18,
-  temporalStabilityBias: 1.35,
-  pointSize: 4.95,
+  visibleBudget: 1_800_000,
+  overdrawBudget: 260_000,
+  activePages: 768,
+  residentPages: 2_048,
+  uploadsPerFrame: 160,
+  minProjectedNodeSizePx: 9,
+  peripheralFoveation: 1.1,
+  heroTiles: 0,
+  temporalStabilityBias: 1.18,
+  pointSize: 5.15,
   opacity: 0.98,
   colorGain: 1.03,
-  targetFrameMs: 60,
-  minPixelRatio: 0.55,
-  maxPixelRatio: 1.2,
-  useGpuVisibilityReadback: true,
+  targetFrameMs: 16.7,
+  minPixelRatio: 0.9,
+  maxPixelRatio: 1.1,
+  useGpuVisibilityReadback: false,
   orbitRadiusScale: 0.66,
   orbitHeightScale: 0.18,
   orbitDepthScale: 0.58,
@@ -269,7 +269,7 @@ async function bootstrap(): Promise<void> {
       maxActivePages: COMPLEX_SPLAT_PRESET.activePages,
       maxResidentPages: COMPLEX_SPLAT_PRESET.residentPages,
       maxPageUploadsPerFrame: COMPLEX_SPLAT_PRESET.uploadsPerFrame,
-      minProjectedNodeSizePx: COMPLEX_SPLAT_PRESET.coverageBiasPx,
+      minProjectedNodeSizePx: COMPLEX_SPLAT_PRESET.minProjectedNodeSizePx,
       peripheralFoveation: COMPLEX_SPLAT_PRESET.peripheralFoveation,
       heroTileBudget: COMPLEX_SPLAT_PRESET.heroTiles,
       temporalStabilityBias: COMPLEX_SPLAT_PRESET.temporalStabilityBias,

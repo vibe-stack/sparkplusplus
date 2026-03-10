@@ -2,10 +2,10 @@ import {
   Color,
   DoubleSide,
   DynamicDrawUsage,
+  Vector3,
   InstancedBufferAttribute,
   NormalBlending,
   Sprite,
-  Vector3,
 } from 'three';
 import { SpriteNodeMaterial } from 'three/webgpu';
 import {
@@ -17,10 +17,9 @@ import {
   vec2,
 } from 'three/tsl';
 import type { Camera } from 'three';
-import type { SplatBudgetOptions } from '../core/budgets';
 import { SPLAT_SEMANTIC_FLAGS } from '../core/semantics';
+import type { SplatBudgetOptions } from '../core/budgets';
 import type { SplatMeshSelection } from '../scheduler/bootstrap-scheduler';
-import { SplatTileClassifier } from './tile-classifier';
 import type { SplatMesh } from '../scene/splat-mesh';
 
 export interface SplatCompositorSnapshot {
@@ -64,53 +63,28 @@ interface PreparedPageCache {
 }
 
 export class SplatSpriteCompositor {
-  private readonly tileClassifier = new SplatTileClassifier();
-  private readonly depthSliceCount = 2;
   private readonly preparedPageCache = new Map<number, PreparedPageCache>();
 
-  private weightedSprite?: Sprite;
-  private heroSprite?: Sprite;
-  private readonly depthSprites: Sprite[] = [];
-  private weightedMaterial?: SpriteNodeMaterial;
-  private heroMaterial?: SpriteNodeMaterial;
-  private readonly depthMaterials: SpriteNodeMaterial[] = [];
+  private sprite?: Sprite;
+  private material?: SpriteNodeMaterial;
+  private positionAttribute?: InstancedBufferAttribute;
+  private scaleAttribute?: InstancedBufferAttribute;
+  private colorAttribute?: InstancedBufferAttribute;
+  private opacityAttribute?: InstancedBufferAttribute;
 
-  private weightedPositionAttribute?: InstancedBufferAttribute;
-  private weightedScaleAttribute?: InstancedBufferAttribute;
-  private weightedColorAttribute?: InstancedBufferAttribute;
-  private weightedOpacityAttribute?: InstancedBufferAttribute;
-  private heroPositionAttribute?: InstancedBufferAttribute;
-  private heroScaleAttribute?: InstancedBufferAttribute;
-  private heroColorAttribute?: InstancedBufferAttribute;
-  private heroOpacityAttribute?: InstancedBufferAttribute;
-  private readonly depthPositionAttributes: InstancedBufferAttribute[] = [];
-  private readonly depthScaleAttributes: InstancedBufferAttribute[] = [];
-  private readonly depthColorAttributes: InstancedBufferAttribute[] = [];
-  private readonly depthOpacityAttributes: InstancedBufferAttribute[] = [];
-
-  private weightedPositionArray = new Float32Array(0);
-  private weightedScaleArray = new Float32Array(0);
-  private weightedColorArray = new Float32Array(0);
-  private weightedOpacityArray = new Float32Array(0);
-  private heroPositionArray = new Float32Array(0);
-  private heroScaleArray = new Float32Array(0);
-  private heroColorArray = new Float32Array(0);
-  private heroOpacityArray = new Float32Array(0);
-  private depthPositionArrays: Float32Array[] = [];
-  private depthScaleArrays: Float32Array[] = [];
-  private depthColorArrays: Float32Array[] = [];
-  private depthOpacityArrays: Float32Array[] = [];
+  private positionArray = new Float32Array(0);
+  private scaleArray = new Float32Array(0);
+  private colorArray = new Float32Array(0);
+  private opacityArray = new Float32Array(0);
 
   private readonly colorScratch = new Color();
   private readonly effectTintScratch = new Color();
-  private readonly worldPositionScratch = new Vector3();
-  private readonly cameraPositionScratch = new Vector3();
-  private readonly clusterCenterScratch = new Vector3();
+  private readonly clusterPositionScratch = new Vector3();
   private snapshot: SplatCompositorSnapshot = EMPTY_SNAPSHOT;
   private lastBuildSignature = '';
 
   constructor(private readonly owner: SplatMesh) {
-    this.ensureCapacity(256, 64, 128);
+    this.ensureCapacity(256);
   }
 
   getSnapshot(): SplatCompositorSnapshot {
@@ -120,384 +94,170 @@ export class SplatSpriteCompositor {
   sync(selection: SplatMeshSelection, context: SplatCompositorFrameContext): void {
     const asset = this.owner.getAsset();
     const canUsePreparedPages = this.canUsePreparedPages();
-    const tileClassification = this.tileClassifier.classify(
-      this.owner,
-      selection.activeClusters,
-      context.camera,
-      context.viewportWidth,
-      context.viewportHeight,
-      context.budgets,
+    const sortedActiveClusters = [...selection.activeClusters].sort((left, right) =>
+      this.getClusterCameraDepth(asset.clusters[left.clusterId]!, context.camera)
+      - this.getClusterCameraDepth(asset.clusters[right.clusterId]!, context.camera),
     );
-    const frameBucket = Math.floor(context.frameIndex / Math.max(1, context.budgets.effectUpdateCadence));
-    const clusterModeSignature = selection.activeClusters
-      .map((cluster) => `${cluster.clusterId}:${tileClassification.clusterModes.get(cluster.clusterId) ?? 'weighted'}`)
-      .join('|');
-    // Do NOT include a camera-position bucket in the signature.  The fine-
-    // grained quantisation (×4 position, ×16 direction) caused a full
-    // per-splat CPU array rebuild on every sub-0.25m camera movement, making
-    // the compositor O(active_splats) every frame regardless of page changes.
+    const frameBucket = this.owner.effectStack.hasTemporalEffects()
+      ? Math.floor(context.frameIndex / Math.max(1, context.budgets.effectUpdateCadence))
+      : 0;
     const buildSignature = [
-      selection.activePageIds.join(','),
-      clusterModeSignature,
+      sortedActiveClusters.map((cluster) => cluster.clusterId).join(','),
       this.owner.getMaterialVersion(),
       this.owner.getEffectVersion(),
       frameBucket,
     ].join('::');
 
-    if (selection.activeClusters.length === 0) {
+    if (sortedActiveClusters.length === 0) {
       this.lastBuildSignature = '';
-      this.snapshot = {
-        ...EMPTY_SNAPSHOT,
-        activeTiles: tileClassification.activeTiles,
-        weightedTiles: tileClassification.weightedTiles,
-        depthSlicedTiles: tileClassification.depthSlicedTiles,
-        heroTiles: tileClassification.heroTiles,
-      };
-      this.syncSprites(0, 0, [0, 0]);
+      this.snapshot = EMPTY_SNAPSHOT;
+      this.syncSprite(0);
       return;
     }
 
     if (buildSignature === this.lastBuildSignature) {
-      this.snapshot = {
-        ...this.snapshot,
-        activeTiles: tileClassification.activeTiles,
-        weightedTiles: tileClassification.weightedTiles,
-        depthSlicedTiles: tileClassification.depthSlicedTiles,
-        heroTiles: tileClassification.heroTiles,
-        maxTileComplexity: tileClassification.maxTileComplexity,
-      };
       return;
     }
 
     this.lastBuildSignature = buildSignature;
 
-    let weightedQueueEstimate = 0;
-    let heroQueueEstimate = 0;
-    let depthQueueEstimate = 0;
+    let queueEstimate = 0;
 
-    for (const activeCluster of selection.activeClusters) {
-      const page = asset.pages[activeCluster.pageId]!;
-      const mode = tileClassification.clusterModes.get(activeCluster.clusterId) ?? 'weighted';
-
-      if (mode === 'hero') {
-        heroQueueEstimate += page.splatCount;
-      } else if (mode === 'depth-sliced') {
-        depthQueueEstimate += page.splatCount;
-      } else {
-        weightedQueueEstimate += page.splatCount;
-      }
+    for (const activeCluster of sortedActiveClusters) {
+      queueEstimate += asset.pages[activeCluster.pageId]!.splatCount;
     }
 
-    this.ensureCapacity(weightedQueueEstimate, heroQueueEstimate, depthQueueEstimate);
+    this.ensureCapacity(queueEstimate);
 
-    let weightedCount = 0;
-    let heroCount = 0;
-    const depthCounts = [0, 0];
+    let instanceCount = 0;
 
-    for (const activeCluster of selection.activeClusters) {
+    for (const activeCluster of sortedActiveClusters) {
       const cluster = asset.clusters[activeCluster.clusterId]!;
       const page = asset.pages[activeCluster.pageId]!;
-      const mode = tileClassification.clusterModes.get(cluster.id) ?? 'weighted';
       const preparedPage = canUsePreparedPages ? this.getPreparedPageCache(page) : null;
       const coverageScaleBoost = this.resolveCoverageScaleBoost(cluster);
 
-      if (preparedPage && mode === 'hero') {
+      if (preparedPage) {
         this.copyPreparedPage(
           preparedPage.positions,
           preparedPage.baseScales,
           preparedPage.colors,
           preparedPage.opacities,
-          this.heroPositionArray,
-          this.heroScaleArray,
-          this.heroColorArray,
-          this.heroOpacityArray,
-          heroCount,
-          coverageScaleBoost * 1.1,
-        );
-        heroCount += page.splatCount;
-        continue;
-      }
-
-      if (preparedPage && mode === 'weighted') {
-        this.copyPreparedPage(
-          preparedPage.positions,
-          preparedPage.baseScales,
-          preparedPage.colors,
-          preparedPage.opacities,
-          this.weightedPositionArray,
-          this.weightedScaleArray,
-          this.weightedColorArray,
-          this.weightedOpacityArray,
-          weightedCount,
+          this.positionArray,
+          this.scaleArray,
+          this.colorArray,
+          this.opacityArray,
+          instanceCount,
           coverageScaleBoost,
         );
-        weightedCount += page.splatCount;
+        instanceCount += page.splatCount;
         continue;
       }
 
-      const resolvedEffects = preparedPage
-        ? null
-        : this.owner.effectStack.evaluate(cluster.semanticMask, context.timeSeconds);
-      const clusterCameraDepth = mode === 'depth-sliced'
-        ? this.getCameraDepth(
-            cluster.center[0],
-            cluster.center[1],
-            cluster.center[2],
-            context.camera,
-            this.clusterCenterScratch,
-          )
-        : 0;
-
-      if (resolvedEffects) {
-        this.effectTintScratch.copy(resolvedEffects.tint);
-      }
+      const resolvedEffects = this.owner.effectStack.evaluate(cluster.semanticMask, context.timeSeconds);
+      this.effectTintScratch.copy(resolvedEffects.tint);
 
       for (let splatIndex = 0; splatIndex < page.splatCount; splatIndex += 1) {
         const sourceOffset = splatIndex * 3;
-        const scaleOffset = splatIndex * 2;
-        const isotropicBaseScale = preparedPage
-          ? preparedPage.baseScales[scaleOffset + 0]!
-          : this.resolveBaseSplatScale(page.scales, sourceOffset);
-        const baseScaleX = isotropicBaseScale * coverageScaleBoost;
-        const baseScaleY = isotropicBaseScale * coverageScaleBoost;
+        const baseScale = this.resolveBaseSplatScale(page.scales, sourceOffset) * coverageScaleBoost;
 
-        if (preparedPage) {
-          this.colorScratch.setRGB(
-            preparedPage.colors[sourceOffset + 0]!,
-            preparedPage.colors[sourceOffset + 1]!,
-            preparedPage.colors[sourceOffset + 2]!,
-          );
-        } else {
-          this.colorScratch.setRGB(
-            page.colors[sourceOffset + 0]!,
-            page.colors[sourceOffset + 1]!,
-            page.colors[sourceOffset + 2]!,
-          );
+        this.colorScratch.setRGB(
+          page.colors[sourceOffset + 0]!,
+          page.colors[sourceOffset + 1]!,
+          page.colors[sourceOffset + 2]!,
+        );
 
-          if (this.owner.splatMaterial.debugMode === 'lod') {
-            this.colorScratch.setHSL(Math.min(0.85, cluster.level * 0.12), 0.75, 0.55);
-          }
-
-          if (this.owner.splatMaterial.debugMode === 'semantic') {
-            if ((cluster.semanticMask & SPLAT_SEMANTIC_FLAGS.hero) !== 0) {
-              this.colorScratch.set(0xffe066);
-            } else if ((cluster.semanticMask & SPLAT_SEMANTIC_FLAGS.glass) !== 0) {
-              this.colorScratch.set(0x93c5fd);
-            } else if ((cluster.semanticMask & SPLAT_SEMANTIC_FLAGS.foliage) !== 0) {
-              this.colorScratch.set(0x86efac);
-            } else {
-              this.colorScratch.set(0xf8fafc);
-            }
-          }
-
-          this.colorScratch
-            .multiply(this.owner.splatMaterial.tint)
-            .multiply(this.effectTintScratch)
-            .multiplyScalar(this.owner.splatMaterial.colorGain);
+        if (this.owner.splatMaterial.debugMode === 'lod') {
+          this.colorScratch.setHSL(Math.min(0.85, cluster.level * 0.12), 0.75, 0.55);
         }
 
-        const opacity = preparedPage
-          ? preparedPage.opacities[splatIndex]!
-          : Math.min(
-              1,
-              this.owner.splatMaterial.opacity * page.opacities[splatIndex]! * resolvedEffects!.opacityMultiplier,
-            );
-        const resolvedScaleX = preparedPage ? baseScaleX : baseScaleX * resolvedEffects!.pointSizeMultiplier;
-        const resolvedScaleY = preparedPage ? baseScaleY : baseScaleY * resolvedEffects!.pointSizeMultiplier;
-
-        if (mode === 'hero') {
-          this.writeInstance(
-            this.heroPositionArray,
-            this.heroScaleArray,
-            this.heroColorArray,
-            this.heroOpacityArray,
-            heroCount,
-            page.positions[sourceOffset + 0]!,
-            page.positions[sourceOffset + 1]!,
-            page.positions[sourceOffset + 2]!,
-            resolvedScaleX * 1.1,
-            resolvedScaleY * 1.1,
-            this.colorScratch,
-            opacity,
-          );
-          heroCount += 1;
-        } else {
-          if (mode === 'depth-sliced') {
-            const depthSliceIndex = this.resolveDepthSlice(
-              page.positions[sourceOffset + 0]!,
-              page.positions[sourceOffset + 1]!,
-              page.positions[sourceOffset + 2]!,
-              clusterCameraDepth,
-              context.camera,
-            );
-
-            this.writeInstance(
-              this.depthPositionArrays[depthSliceIndex]!,
-              this.depthScaleArrays[depthSliceIndex]!,
-              this.depthColorArrays[depthSliceIndex]!,
-              this.depthOpacityArrays[depthSliceIndex]!,
-              depthCounts[depthSliceIndex]!,
-              page.positions[sourceOffset + 0]!,
-              page.positions[sourceOffset + 1]!,
-              page.positions[sourceOffset + 2]!,
-              resolvedScaleX,
-              resolvedScaleY,
-              this.colorScratch,
-              opacity,
-            );
-            depthCounts[depthSliceIndex] = depthCounts[depthSliceIndex]! + 1;
-            continue;
+        if (this.owner.splatMaterial.debugMode === 'semantic') {
+          if ((cluster.semanticMask & SPLAT_SEMANTIC_FLAGS.hero) !== 0) {
+            this.colorScratch.set(0xffe066);
+          } else if ((cluster.semanticMask & SPLAT_SEMANTIC_FLAGS.glass) !== 0) {
+            this.colorScratch.set(0x93c5fd);
+          } else if ((cluster.semanticMask & SPLAT_SEMANTIC_FLAGS.foliage) !== 0) {
+            this.colorScratch.set(0x86efac);
+          } else {
+            this.colorScratch.set(0xf8fafc);
           }
-
-          this.writeInstance(
-            this.weightedPositionArray,
-            this.weightedScaleArray,
-            this.weightedColorArray,
-            this.weightedOpacityArray,
-            weightedCount,
-            page.positions[sourceOffset + 0]!,
-            page.positions[sourceOffset + 1]!,
-            page.positions[sourceOffset + 2]!,
-            resolvedScaleX,
-            resolvedScaleY,
-            this.colorScratch,
-            opacity,
-          );
-          weightedCount += 1;
         }
+
+        this.colorScratch
+          .multiply(this.owner.splatMaterial.tint)
+          .multiply(this.effectTintScratch)
+          .multiplyScalar(this.owner.splatMaterial.colorGain);
+
+        this.writeInstance(
+          instanceCount,
+          page.positions[sourceOffset + 0]!,
+          page.positions[sourceOffset + 1]!,
+          page.positions[sourceOffset + 2]!,
+          baseScale * resolvedEffects.pointSizeMultiplier,
+          baseScale * resolvedEffects.pointSizeMultiplier,
+          this.colorScratch,
+          Math.min(
+            1,
+            this.owner.splatMaterial.opacity * page.opacities[splatIndex]! * resolvedEffects.opacityMultiplier,
+          ),
+        );
+        instanceCount += 1;
       }
     }
 
-    this.flushAttributes(weightedCount, heroCount, depthCounts);
-    this.syncSprites(weightedCount, heroCount, depthCounts);
+    this.flushAttributes(instanceCount);
+    this.syncSprite(instanceCount);
     this.snapshot = {
-      weightedInstances: weightedCount,
-      heroInstances: heroCount,
-      depthSlicedInstances: depthCounts[0]! + depthCounts[1]!,
-      activeTiles: tileClassification.activeTiles,
-      weightedTiles: tileClassification.weightedTiles,
-      depthSlicedTiles: tileClassification.depthSlicedTiles,
-      heroTiles: tileClassification.heroTiles,
-      maxTileComplexity: tileClassification.maxTileComplexity,
+      weightedInstances: instanceCount,
+      heroInstances: 0,
+      depthSlicedInstances: 0,
+      activeTiles: 0,
+      weightedTiles: 0,
+      depthSlicedTiles: 0,
+      heroTiles: 0,
+      maxTileComplexity: 0,
     };
   }
 
-  private ensureCapacity(weightedCapacity: number, heroCapacity: number, depthCapacity: number): void {
-    const needsWeightedResize = this.weightedPositionArray.length < weightedCapacity * 3;
-    const needsHeroResize = this.heroPositionArray.length < heroCapacity * 3;
-    const needsDepthResize = this.depthPositionArrays.some((array) => array.length < depthCapacity * 3);
-
-    if (!needsWeightedResize && !needsHeroResize && !needsDepthResize) {
+  private ensureCapacity(requiredCapacity: number): void {
+    if (this.positionArray.length >= requiredCapacity * 3) {
       return;
     }
 
-    const nextWeightedCapacity = this.resolveCapacity(
-      Math.floor(this.weightedPositionArray.length / 3),
-      weightedCapacity,
+    const nextCapacity = this.resolveCapacity(
+      Math.floor(this.positionArray.length / 3),
+      requiredCapacity,
       256,
     );
-    const nextHeroCapacity = this.resolveCapacity(
-      Math.floor(this.heroPositionArray.length / 3),
-      heroCapacity,
-      64,
-    );
-    const nextDepthCapacity = this.resolveCapacity(
-      Math.floor((this.depthPositionArrays[0]?.length ?? 0) / 3),
-      depthCapacity,
-      128,
-    );
 
-    this.weightedPositionArray = new Float32Array(nextWeightedCapacity * 3);
-    this.weightedScaleArray = new Float32Array(nextWeightedCapacity * 2);
-    this.weightedColorArray = new Float32Array(nextWeightedCapacity * 3);
-    this.weightedOpacityArray = new Float32Array(nextWeightedCapacity);
-    this.heroPositionArray = new Float32Array(nextHeroCapacity * 3);
-    this.heroScaleArray = new Float32Array(nextHeroCapacity * 2);
-    this.heroColorArray = new Float32Array(nextHeroCapacity * 3);
-    this.heroOpacityArray = new Float32Array(nextHeroCapacity);
-    this.depthPositionArrays = Array.from({ length: this.depthSliceCount }, () => new Float32Array(nextDepthCapacity * 3));
-    this.depthScaleArrays = Array.from({ length: this.depthSliceCount }, () => new Float32Array(nextDepthCapacity * 2));
-    this.depthColorArrays = Array.from({ length: this.depthSliceCount }, () => new Float32Array(nextDepthCapacity * 3));
-    this.depthOpacityArrays = Array.from({ length: this.depthSliceCount }, () => new Float32Array(nextDepthCapacity));
-
-    this.rebuildSprites();
+    this.positionArray = new Float32Array(nextCapacity * 3);
+    this.scaleArray = new Float32Array(nextCapacity * 2);
+    this.colorArray = new Float32Array(nextCapacity * 3);
+    this.opacityArray = new Float32Array(nextCapacity);
+    this.rebuildSprite();
   }
 
-  private rebuildSprites(): void {
-    if (this.weightedSprite) {
-      this.owner.remove(this.weightedSprite);
+  private rebuildSprite(): void {
+    if (this.sprite) {
+      this.owner.remove(this.sprite);
     }
 
-    if (this.heroSprite) {
-      this.owner.remove(this.heroSprite);
-    }
-
-    this.depthSprites.forEach((sprite) => this.owner.remove(sprite));
-    this.depthSprites.length = 0;
-    this.depthMaterials.length = 0;
-    this.depthPositionAttributes.length = 0;
-    this.depthScaleAttributes.length = 0;
-    this.depthColorAttributes.length = 0;
-    this.depthOpacityAttributes.length = 0;
-
-    this.weightedPositionAttribute = this.createAttribute(this.weightedPositionArray, 3);
-    this.weightedScaleAttribute = this.createAttribute(this.weightedScaleArray, 2);
-    this.weightedColorAttribute = this.createAttribute(this.weightedColorArray, 3);
-    this.weightedOpacityAttribute = this.createAttribute(this.weightedOpacityArray, 1);
-    this.heroPositionAttribute = this.createAttribute(this.heroPositionArray, 3);
-    this.heroScaleAttribute = this.createAttribute(this.heroScaleArray, 2);
-    this.heroColorAttribute = this.createAttribute(this.heroColorArray, 3);
-    this.heroOpacityAttribute = this.createAttribute(this.heroOpacityArray, 1);
-
-    this.weightedMaterial = this.createMaterial(
-      this.weightedPositionAttribute,
-      this.weightedScaleAttribute,
-      this.weightedColorAttribute,
-      this.weightedOpacityAttribute,
+    this.positionAttribute = this.createAttribute(this.positionArray, 3);
+    this.scaleAttribute = this.createAttribute(this.scaleArray, 2);
+    this.colorAttribute = this.createAttribute(this.colorArray, 3);
+    this.opacityAttribute = this.createAttribute(this.opacityArray, 1);
+    this.material = this.createMaterial(
+      this.positionAttribute,
+      this.scaleAttribute,
+      this.colorAttribute,
+      this.opacityAttribute,
     );
-    this.heroMaterial = this.createMaterial(
-      this.heroPositionAttribute,
-      this.heroScaleAttribute,
-      this.heroColorAttribute,
-      this.heroOpacityAttribute,
-    );
-
-    this.weightedSprite = new Sprite(this.weightedMaterial);
-    this.weightedSprite.count = 0;
-    this.weightedSprite.frustumCulled = false;
-    this.weightedSprite.renderOrder = 21;
-    this.weightedSprite.name = 'SparkWeightedSpriteQueue';
-
-    for (let sliceIndex = 0; sliceIndex < this.depthSliceCount; sliceIndex += 1) {
-      const positionAttribute = this.createAttribute(this.depthPositionArrays[sliceIndex]!, 3);
-      const scaleAttribute = this.createAttribute(this.depthScaleArrays[sliceIndex]!, 2);
-      const colorAttribute = this.createAttribute(this.depthColorArrays[sliceIndex]!, 3);
-      const opacityAttribute = this.createAttribute(this.depthOpacityArrays[sliceIndex]!, 1);
-      const material = this.createMaterial(positionAttribute, scaleAttribute, colorAttribute, opacityAttribute);
-      const sprite = new Sprite(material);
-
-      sprite.count = 0;
-      sprite.frustumCulled = false;
-      sprite.renderOrder = 19 + sliceIndex;
-      sprite.name = `SparkDepthSliceQueue${sliceIndex}`;
-
-      this.depthPositionAttributes.push(positionAttribute);
-      this.depthScaleAttributes.push(scaleAttribute);
-      this.depthColorAttributes.push(colorAttribute);
-      this.depthOpacityAttributes.push(opacityAttribute);
-      this.depthMaterials.push(material);
-      this.depthSprites.push(sprite);
-      this.owner.add(sprite);
-    }
-
-    this.heroSprite = new Sprite(this.heroMaterial);
-    this.heroSprite.count = 0;
-    this.heroSprite.frustumCulled = false;
-    this.heroSprite.renderOrder = 23;
-    this.heroSprite.name = 'SparkHeroSpriteQueue';
-
-    this.owner.add(this.weightedSprite);
-    this.owner.add(this.heroSprite);
+    this.sprite = new Sprite(this.material);
+    this.sprite.count = 0;
+    this.sprite.frustumCulled = false;
+    this.sprite.renderOrder = 21;
+    this.sprite.name = 'SparkSpriteQueue';
+    this.owner.add(this.sprite);
   }
 
   private createMaterial(
@@ -512,20 +272,17 @@ export class SplatSpriteCompositor {
     const radial = lengthSq(centeredUv);
     const feather = smoothstep(1.0, 0.5, radial);
     const gaussian = exp(radial.mul(-10.5));
-    const colorNode = instancedBufferAttribute(colorAttribute);
-    const opacityNode = instancedBufferAttribute(opacityAttribute);
-    const alphaNode = opacityNode.mul(gaussian).mul(feather);
+    const alphaNode = instancedBufferAttribute(opacityAttribute).mul(gaussian).mul(feather);
 
     material.positionNode = instancedBufferAttribute(positionAttribute);
     material.scaleNode = instancedBufferAttribute(scaleAttribute);
-    material.colorNode = colorNode.mul(alphaNode);
+    material.colorNode = instancedBufferAttribute(colorAttribute).mul(alphaNode);
     material.opacityNode = alphaNode;
     material.maskNode = radial.lessThan(1.0);
     material.transparent = true;
     material.depthWrite = false;
     material.sizeAttenuation = true;
     material.side = DoubleSide;
-
     material.blending = NormalBlending;
     material.premultipliedAlpha = true;
 
@@ -538,22 +295,11 @@ export class SplatSpriteCompositor {
     return attribute;
   }
 
-  private flushAttributes(weightedCount: number, heroCount: number, depthCounts: readonly number[]): void {
-    this.updateAttribute(this.weightedPositionAttribute, weightedCount, 3);
-    this.updateAttribute(this.weightedScaleAttribute, weightedCount, 2);
-    this.updateAttribute(this.weightedColorAttribute, weightedCount, 3);
-    this.updateAttribute(this.weightedOpacityAttribute, weightedCount, 1);
-    this.updateAttribute(this.heroPositionAttribute, heroCount, 3);
-    this.updateAttribute(this.heroScaleAttribute, heroCount, 2);
-    this.updateAttribute(this.heroColorAttribute, heroCount, 3);
-    this.updateAttribute(this.heroOpacityAttribute, heroCount, 1);
-
-    for (let sliceIndex = 0; sliceIndex < this.depthSliceCount; sliceIndex += 1) {
-      this.updateAttribute(this.depthPositionAttributes[sliceIndex], depthCounts[sliceIndex] ?? 0, 3);
-      this.updateAttribute(this.depthScaleAttributes[sliceIndex], depthCounts[sliceIndex] ?? 0, 2);
-      this.updateAttribute(this.depthColorAttributes[sliceIndex], depthCounts[sliceIndex] ?? 0, 3);
-      this.updateAttribute(this.depthOpacityAttributes[sliceIndex], depthCounts[sliceIndex] ?? 0, 1);
-    }
+  private flushAttributes(instanceCount: number): void {
+    this.updateAttribute(this.positionAttribute, instanceCount, 3);
+    this.updateAttribute(this.scaleAttribute, instanceCount, 2);
+    this.updateAttribute(this.colorAttribute, instanceCount, 3);
+    this.updateAttribute(this.opacityAttribute, instanceCount, 1);
   }
 
   private updateAttribute(
@@ -570,33 +316,16 @@ export class SplatSpriteCompositor {
     attribute.addUpdateRange(0, count * itemSize);
   }
 
-  private syncSprites(weightedCount: number, heroCount: number, depthCounts: readonly number[]): void {
-    if (this.weightedSprite) {
-      this.weightedSprite.count = weightedCount;
-      this.weightedSprite.visible = weightedCount > 0;
+  private syncSprite(instanceCount: number): void {
+    if (!this.sprite) {
+      return;
     }
 
-    for (let sliceIndex = 0; sliceIndex < this.depthSliceCount; sliceIndex += 1) {
-      const sprite = this.depthSprites[sliceIndex];
-      const count = depthCounts[sliceIndex] ?? 0;
-
-      if (sprite) {
-        sprite.count = count;
-        sprite.visible = count > 0;
-      }
-    }
-
-    if (this.heroSprite) {
-      this.heroSprite.count = heroCount;
-      this.heroSprite.visible = heroCount > 0;
-    }
+    this.sprite.count = instanceCount;
+    this.sprite.visible = instanceCount > 0;
   }
 
   private writeInstance(
-    positionArray: Float32Array,
-    scaleArray: Float32Array,
-    colorArray: Float32Array,
-    opacityArray: Float32Array,
     index: number,
     x: number,
     y: number,
@@ -608,15 +337,15 @@ export class SplatSpriteCompositor {
   ): void {
     const positionOffset = index * 3;
     const scaleOffset = index * 2;
-    positionArray[positionOffset + 0] = x;
-    positionArray[positionOffset + 1] = y;
-    positionArray[positionOffset + 2] = z;
-    scaleArray[scaleOffset + 0] = scaleX;
-    scaleArray[scaleOffset + 1] = scaleY;
-    colorArray[positionOffset + 0] = color.r;
-    colorArray[positionOffset + 1] = color.g;
-    colorArray[positionOffset + 2] = color.b;
-    opacityArray[index] = opacity;
+    this.positionArray[positionOffset + 0] = x;
+    this.positionArray[positionOffset + 1] = y;
+    this.positionArray[positionOffset + 2] = z;
+    this.scaleArray[scaleOffset + 0] = scaleX;
+    this.scaleArray[scaleOffset + 1] = scaleY;
+    this.colorArray[positionOffset + 0] = color.r;
+    this.colorArray[positionOffset + 1] = color.g;
+    this.colorArray[positionOffset + 2] = color.b;
+    this.opacityArray[index] = opacity;
   }
 
   private canUsePreparedPages(): boolean {
@@ -714,7 +443,7 @@ export class SplatSpriteCompositor {
     cluster: ReturnType<SplatMesh['getAsset']>['clusters'][number],
   ): number {
     const representationGap = cluster.representedSplatCount / Math.max(1, cluster.splatCount);
-    return Math.min(1.85, 1 + Math.log2(Math.max(1, representationGap)) * 0.14);
+    return Math.min(1.7, 1 + Math.log2(Math.max(1, representationGap)) * 0.12);
   }
 
   private resolveBaseSplatScale(
@@ -730,27 +459,15 @@ export class SplatSpriteCompositor {
     return Math.max(0.012, isotropicScale * pointSize * 0.64);
   }
 
-  private resolveDepthSlice(
-    x: number,
-    y: number,
-    z: number,
-    clusterCameraDepth: number,
+  private getClusterCameraDepth(
+    cluster: ReturnType<SplatMesh['getAsset']>['clusters'][number],
     camera: Camera,
   ): number {
-    const splatCameraDepth = this.getCameraDepth(x, y, z, camera, this.worldPositionScratch);
-    return splatCameraDepth < clusterCameraDepth ? 0 : 1;
-  }
-
-  private getCameraDepth(
-    x: number,
-    y: number,
-    z: number,
-    camera: Camera,
-    target: Vector3,
-  ): number {
-    target.set(x, y, z).applyMatrix4(this.owner.matrixWorld).applyMatrix4(camera.matrixWorldInverse);
-    this.cameraPositionScratch.copy(target);
-    return this.cameraPositionScratch.z;
+    return this.clusterPositionScratch
+      .set(cluster.center[0], cluster.center[1], cluster.center[2])
+      .applyMatrix4(this.owner.matrixWorld)
+      .applyMatrix4(camera.matrixWorldInverse)
+      .z;
   }
 }
 

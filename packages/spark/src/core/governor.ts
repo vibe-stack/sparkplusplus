@@ -77,7 +77,7 @@ export class SplatQualityGovernor {
         : pageFaultSpike
           ? 'page fault pressure'
           : 'overdraw pressure';
-      const nextLevelCap = nextReason === 'overdraw pressure' ? 7 : 4;
+      const nextLevelCap = nextReason === 'overdraw pressure' ? 6 : 4;
       this.level = Math.min(this.level + 1, nextLevelCap);
       this.reason = nextReason;
       this.stableFrames = 0;
@@ -135,10 +135,6 @@ export class SplatQualityGovernor {
     if (level >= 6) {
       budgets.minProjectedNodeSizePx = Math.round(budgets.minProjectedNodeSizePx * 1.25);
       budgets.maxResidentPages = Math.max(16, Math.round(budgets.maxResidentPages * 0.75));
-    }
-
-    if (level >= 7) {
-      budgets.renderScale = 0.85;
     }
 
     return budgets;

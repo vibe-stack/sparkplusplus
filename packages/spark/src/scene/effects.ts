@@ -37,6 +37,10 @@ export class SplatEffectStack {
     return this.effects.every((effect) => effect.enabled === false);
   }
 
+  hasTemporalEffects(): boolean {
+    return this.effects.some((effect) => effect.enabled !== false && effect.kind === 'pulse');
+  }
+
   evaluate(semanticMask: number, timeSeconds: number): SplatResolvedEffects {
     const tint = new Color(1, 1, 1);
     let opacityMultiplier = 1;
