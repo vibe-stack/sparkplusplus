@@ -244,7 +244,7 @@ export class SplatTileClassifier {
 
     // Expand coverage by one tile so clusters near a tile boundary or with
     // centers just outside clip space still keep the adjacent visible tiles.
-    const tilePadding = 1;
+    const tilePadding = 2;
     const minTileX = Math.max(0, Math.floor((screenX - screenRadius) / tileSizePx) - tilePadding);
     const maxTileX = Math.min(
       Math.ceil(viewportWidth / tileSizePx) - 1,

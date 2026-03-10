@@ -103,11 +103,12 @@ export class SplatPageTable {
     maxUploads: number,
     frameIndex: number,
     protectedPageIds: ReadonlySet<number>,
+    requestPriorityByPage?: ReadonlyMap<number, number>,
   ): number[] {
     const uploadedPageIds: number[] = [];
 
     while (uploadedPageIds.length < maxUploads) {
-      const pageId = this.selectMostRecentRequestedPageId();
+      const pageId = this.selectRequestedPageId(requestPriorityByPage);
 
       if (pageId === null) {
         break;
@@ -134,8 +135,9 @@ export class SplatPageTable {
     return uploadedPageIds;
   }
 
-  private selectMostRecentRequestedPageId(): number | null {
+  private selectRequestedPageId(requestPriorityByPage?: ReadonlyMap<number, number>): number | null {
     let selectedPageId: number | null = null;
+    let bestPriority = Number.NEGATIVE_INFINITY;
     let newestRequestSerial = -1;
 
     this.records.forEach((record, pageId) => {
@@ -143,7 +145,13 @@ export class SplatPageTable {
         return;
       }
 
-      if (record.requestSerial > newestRequestSerial) {
+      const priority = requestPriorityByPage?.get(pageId) ?? 0;
+
+      if (
+        priority > bestPriority
+        || (priority === bestPriority && record.requestSerial > newestRequestSerial)
+      ) {
+        bestPriority = priority;
         newestRequestSerial = record.requestSerial;
         selectedPageId = pageId;
       }

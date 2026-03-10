@@ -20,6 +20,7 @@ interface ClusterCandidate {
   score: number;
   projectedSizePx: number;
   screenRadius: number;
+  cameraDistance: number;
   visibleCost: number;
   proxySplatCount: number;
   representedSplatCount: number;
@@ -129,6 +130,7 @@ export class BootstrapVisibilityScheduler {
     const meshSelections = new Map<string, SplatMeshSelection>();
     const frontierCandidates = new Map<string, Map<number, ClusterCandidate>>();
     const prefetchProtectedPageIds = new Map<string, Set<number>>();
+    const requestPriorityByMesh = new Map<string, Map<number, number>>();
     const rootCandidates: ClusterCandidate[] = [];
     const frontierBudgetState: FrontierBudgetState = {
       reservedPageSlots: 0,
@@ -156,6 +158,7 @@ export class BootstrapVisibilityScheduler {
       });
       frontierCandidates.set(mesh.uuid, new Map());
       prefetchProtectedPageIds.set(mesh.uuid, new Set());
+      requestPriorityByMesh.set(mesh.uuid, new Map());
 
       rootCandidates.push(
         ...this.collectSeedCandidates(
@@ -207,6 +210,7 @@ export class BootstrapVisibilityScheduler {
         meshSelections,
         frontierCandidates,
         prefetchProtectedPageIds,
+        requestPriorityByMesh,
       });
     }
 
@@ -215,7 +219,13 @@ export class BootstrapVisibilityScheduler {
     });
 
     for (const descriptor of objects) {
-      this.populateSelectionResidency(descriptor, meshSelections.get(descriptor.mesh.uuid)!, frameIndex);
+      this.populateSelectionResidency(
+        descriptor,
+        meshSelections.get(descriptor.mesh.uuid)!,
+        frontierCandidates.get(descriptor.mesh.uuid)!,
+        requestPriorityByMesh.get(descriptor.mesh.uuid)!,
+        frameIndex,
+      );
     }
 
     this.allocateResidentCapacities(objects, budgets.maxResidentPages);
@@ -238,7 +248,12 @@ export class BootstrapVisibilityScheduler {
         ]);
         const uploaded = descriptor.mesh
           .getPageTable()
-          .serviceRequests(1, frameIndex, protectedPageIds);
+          .serviceRequests(
+            1,
+            frameIndex,
+            protectedPageIds,
+            requestPriorityByMesh.get(descriptor.mesh.uuid)!,
+          );
 
         if (uploaded.length > 0) {
           pageUploads += uploaded.length;
@@ -253,7 +268,13 @@ export class BootstrapVisibilityScheduler {
     }
 
     for (const descriptor of objects) {
-      this.populateSelectionResidency(descriptor, meshSelections.get(descriptor.mesh.uuid)!, frameIndex);
+      this.populateSelectionResidency(
+        descriptor,
+        meshSelections.get(descriptor.mesh.uuid)!,
+        frontierCandidates.get(descriptor.mesh.uuid)!,
+        requestPriorityByMesh.get(descriptor.mesh.uuid)!,
+        frameIndex,
+      );
     }
 
     let visibleSplats = 0;
@@ -300,6 +321,8 @@ export class BootstrapVisibilityScheduler {
   private populateSelectionResidency(
     descriptor: SplatSceneObjectDescriptor,
     selection: SplatMeshSelection,
+    frontierCandidates: ReadonlyMap<number, ClusterCandidate>,
+    requestPriorityByPage: Map<number, number>,
     frameIndex: number,
   ): void {
     const mesh = descriptor.mesh;
@@ -324,6 +347,15 @@ export class BootstrapVisibilityScheduler {
 
       pageTable.request(page.id, frameIndex);
       requestedPageIds.add(page.id);
+      const frontierCandidate = frontierCandidates.get(clusterId);
+
+      if (frontierCandidate) {
+        this.noteRequestPriority(
+          requestPriorityByPage,
+          page.id,
+          this.getRequestPriority(frontierCandidate),
+        );
+      }
 
       const fallbackClusterId = this.findResidentFallbackClusterId(clusterId, asset, pageTable);
 
@@ -580,6 +612,7 @@ export class BootstrapVisibilityScheduler {
     meshSelections: Map<string, SplatMeshSelection>,
     frontierCandidates: Map<string, Map<number, ClusterCandidate>>;
     prefetchProtectedPageIds: Map<string, Set<number>>;
+    requestPriorityByMesh: Map<string, Map<number, number>>;
   }): void {
     const {
       objects,
@@ -592,6 +625,7 @@ export class BootstrapVisibilityScheduler {
       meshSelections,
       frontierCandidates,
       prefetchProtectedPageIds,
+      requestPriorityByMesh,
     } = options;
 
     let madeProgress = true;
@@ -642,6 +676,7 @@ export class BootstrapVisibilityScheduler {
             pageTable,
             frameIndex,
             prefetchProtectedPageIds.get(mesh.uuid)!,
+            requestPriorityByMesh.get(mesh.uuid)!,
           );
 
           if (!this.areReplacementChildrenResident(children, asset, pageTable)) {
@@ -731,11 +766,17 @@ export class BootstrapVisibilityScheduler {
     pageTable: ReturnType<SplatSceneObjectDescriptor['mesh']['getPageTable']>,
     frameIndex: number,
     protectedPageIds: Set<number>,
+    requestPriorityByPage: Map<number, number>,
   ): void {
     for (const child of children) {
       const childPageId = asset.clusters[child.clusterId]!.pageId;
       protectedPageIds.add(childPageId);
       pageTable.request(childPageId, frameIndex);
+      this.noteRequestPriority(
+        requestPriorityByPage,
+        childPageId,
+        this.getRequestPriority(child),
+      );
     }
   }
 
@@ -1048,7 +1089,7 @@ export class BootstrapVisibilityScheduler {
     let screenRadius = 0;
 
     if (gpuResult) {
-      if (!gpuResult.visible || gpuResult.projectedSizePx <= 0.75) {
+      if (!gpuResult.visible || gpuResult.projectedSizePx <= 0.35) {
         return null;
       }
 
@@ -1077,13 +1118,14 @@ export class BootstrapVisibilityScheduler {
       }
 
       projectedSizePx = this.getProjectedRadiusPx(camera, this.worldCenter, this.sphere.radius, viewportHeight);
-      if (projectedSizePx <= 0.35) {
+      if (projectedSizePx <= 0.2) {
         return null;
       }
 
       screenRadius = projectedSizePx;
     }
 
+    const cameraDistance = Math.max(0.001, this.currentCameraPosition.distanceTo(this.worldCenter));
     this.projectedCenter.copy(this.worldCenter).project(camera);
     const radialDistance = Math.min(1.5, Math.hypot(this.projectedCenter.x, this.projectedCenter.y));
     const foveationWeight = Math.max(0.25, 1 - radialDistance * 0.25 * budgets.peripheralFoveation);
@@ -1131,15 +1173,33 @@ export class BootstrapVisibilityScheduler {
       score,
       projectedSizePx,
       screenRadius,
+      cameraDistance,
       visibleCost,
       proxySplatCount,
       representedSplatCount,
     };
   }
 
+  private noteRequestPriority(
+    requestPriorityByPage: Map<number, number>,
+    pageId: number,
+    priority: number,
+  ): void {
+    const existingPriority = requestPriorityByPage.get(pageId) ?? Number.NEGATIVE_INFINITY;
+
+    if (priority > existingPriority) {
+      requestPriorityByPage.set(pageId, priority);
+    }
+  }
+
+  private getRequestPriority(candidate: ClusterCandidate): number {
+    const proximityWeight = 1 / Math.max(0.25, candidate.cameraDistance);
+    return proximityWeight * 4096 + candidate.projectedSizePx * 12 + candidate.score * 0.1;
+  }
+
   private intersectsPaddedFrustum(sphere: Sphere): boolean {
     this.paddedFrustumSphere.center.copy(sphere.center);
-    this.paddedFrustumSphere.radius = sphere.radius * 1.18 + 0.035;
+    this.paddedFrustumSphere.radius = sphere.radius * 1.28 + 0.08;
     return this.frustum.intersectsSphere(this.paddedFrustumSphere);
   }
 
