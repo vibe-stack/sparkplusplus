@@ -1,5 +1,6 @@
 import {
   Color,
+  DoubleSide,
   DynamicDrawUsage,
   InstancedBufferAttribute,
   NormalBlending,
@@ -509,8 +510,8 @@ export class SplatSpriteCompositor {
     const uvNode = uv();
     const centeredUv = uvNode.sub(vec2(0.5)).mul(2.0);
     const radial = lengthSq(centeredUv);
-    const feather = smoothstep(1.0, 0.22, radial);
-    const gaussian = exp(radial.mul(-6.5));
+    const feather = smoothstep(1.0, 0.5, radial);
+    const gaussian = exp(radial.mul(-10.5));
     const colorNode = instancedBufferAttribute(colorAttribute);
     const opacityNode = instancedBufferAttribute(opacityAttribute);
     const alphaNode = opacityNode.mul(gaussian).mul(feather);
@@ -523,6 +524,7 @@ export class SplatSpriteCompositor {
     material.transparent = true;
     material.depthWrite = false;
     material.sizeAttenuation = true;
+    material.side = DoubleSide;
 
     material.blending = NormalBlending;
     material.premultipliedAlpha = true;
@@ -725,7 +727,7 @@ export class SplatSpriteCompositor {
       scales[sourceOffset + 1]!,
       scales[sourceOffset + 2]!,
     );
-    return Math.max(0.014, isotropicScale * pointSize * 0.78);
+    return Math.max(0.012, isotropicScale * pointSize * 0.64);
   }
 
   private resolveDepthSlice(

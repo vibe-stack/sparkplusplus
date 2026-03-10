@@ -101,6 +101,7 @@ export class BootstrapVisibilityScheduler {
   // Smoothing spreads the transition over ~10-15 frames so page uploads keep
   // up and the governor never sees a burst.
   private smoothedCameraMotionFactor = 0;
+  private readonly paddedFrustumSphere = new Sphere();
 
   evaluateScene(options: {
     objects: readonly SplatSceneObjectDescriptor[];
@@ -554,12 +555,14 @@ export class BootstrapVisibilityScheduler {
     gpuVisibility?: SplatGpuVisibilityReadback,
   ): ClusterCandidate[] {
     const asset = descriptor.mesh.getAsset();
-    // Always reseed the CPU frontier from roots. Reusing the previous frontier
-    // as the seed can strand visible sibling regions once one descendant under
-    // a root survives scoring, which manifests as in-view tiles disappearing
-    // exactly when the camera settles. Temporal history is still consumed later
-    // via temporalWeight and pinned-descendant checks.
-    return asset.rootClusterIds
+    const previousFrontier = this.cameraMotionFactor < 0.3
+      ? descriptor.mesh.getPreviousFrontierClusterIds()
+      : [];
+    const seedClusterIds = [
+      ...new Set([...asset.rootClusterIds, ...previousFrontier]),
+    ];
+
+    return seedClusterIds
       .map((clusterId) =>
         this.scoreCandidate(descriptor, clusterId, camera, viewportHeight, pageTable, budgets, gpuVisibility),
       )
@@ -1069,12 +1072,12 @@ export class BootstrapVisibilityScheduler {
       this.sphere.center.copy(this.worldCenter);
       this.sphere.radius = cluster.radius * maxScale;
 
-      if (!this.frustum.intersectsSphere(this.sphere)) {
+      if (!this.intersectsPaddedFrustum(this.sphere)) {
         return null;
       }
 
       projectedSizePx = this.getProjectedRadiusPx(camera, this.worldCenter, this.sphere.radius, viewportHeight);
-      if (projectedSizePx <= 0.75) {
+      if (projectedSizePx <= 0.35) {
         return null;
       }
 
@@ -1132,6 +1135,12 @@ export class BootstrapVisibilityScheduler {
       proxySplatCount,
       representedSplatCount,
     };
+  }
+
+  private intersectsPaddedFrustum(sphere: Sphere): boolean {
+    this.paddedFrustumSphere.center.copy(sphere.center);
+    this.paddedFrustumSphere.radius = sphere.radius * 1.18 + 0.035;
+    return this.frustum.intersectsSphere(this.paddedFrustumSphere);
   }
 
   private getProjectedRadiusPx(

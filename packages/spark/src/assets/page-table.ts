@@ -10,6 +10,7 @@ export const enum SplatPageResidencyState {
 interface SplatPageResidencyRecord {
   state: SplatPageResidencyState;
   requestFrame: number;
+  requestSerial: number;
   residentFrame: number;
   lastTouchedFrame: number;
   faultCount: number;
@@ -17,7 +18,7 @@ interface SplatPageResidencyRecord {
 
 export class SplatPageTable {
   private readonly records: SplatPageResidencyRecord[];
-  private readonly requestQueue: number[] = [];
+  private requestSerialCounter = 0;
   private residentCapacity: number;
   private residentCount = 0;
 
@@ -28,6 +29,7 @@ export class SplatPageTable {
     this.records = asset.pages.map(() => ({
       state: SplatPageResidencyState.Unloaded,
       requestFrame: 0,
+      requestSerial: 0,
       residentFrame: 0,
       lastTouchedFrame: 0,
       faultCount: 0,
@@ -58,11 +60,18 @@ export class SplatPageTable {
     if (record.state !== SplatPageResidencyState.Requested) {
       record.state = SplatPageResidencyState.Requested;
       record.requestFrame = frameIndex;
+      record.requestSerial = this.nextRequestSerial();
       record.faultCount += 1;
-      this.requestQueue.push(pageId);
       this.syncBuffer(pageId);
       return true;
     }
+
+    // Refresh requested pages when they are demanded again so uploads prioritize
+    // the most recently visible region instead of draining stale FIFO work from
+    // an old camera view.
+    record.requestFrame = frameIndex;
+    record.requestSerial = this.nextRequestSerial();
+    this.syncBuffer(pageId);
 
     return false;
   }
@@ -87,7 +96,7 @@ export class SplatPageTable {
   }
 
   getPendingCount(): number {
-    return this.requestQueue.filter((pageId) => this.records[pageId]?.state === SplatPageResidencyState.Requested).length;
+    return this.records.filter((record) => record.state === SplatPageResidencyState.Requested).length;
   }
 
   serviceRequests(
@@ -97,18 +106,14 @@ export class SplatPageTable {
   ): number[] {
     const uploadedPageIds: number[] = [];
 
-    while (uploadedPageIds.length < maxUploads && this.requestQueue.length > 0) {
-      const pageId = this.requestQueue.shift();
+    while (uploadedPageIds.length < maxUploads) {
+      const pageId = this.selectMostRecentRequestedPageId();
 
-      if (pageId === undefined) {
+      if (pageId === null) {
         break;
       }
 
-      const record = this.records[pageId];
-
-      if (!record || record.state !== SplatPageResidencyState.Requested) {
-        continue;
-      }
+      const record = this.records[pageId]!;
 
       if (this.residentCount >= this.residentCapacity) {
         const evicted = this.evictColdest(protectedPageIds);
@@ -127,6 +132,29 @@ export class SplatPageTable {
     }
 
     return uploadedPageIds;
+  }
+
+  private selectMostRecentRequestedPageId(): number | null {
+    let selectedPageId: number | null = null;
+    let newestRequestSerial = -1;
+
+    this.records.forEach((record, pageId) => {
+      if (record.state !== SplatPageResidencyState.Requested) {
+        return;
+      }
+
+      if (record.requestSerial > newestRequestSerial) {
+        newestRequestSerial = record.requestSerial;
+        selectedPageId = pageId;
+      }
+    });
+
+    return selectedPageId;
+  }
+
+  private nextRequestSerial(): number {
+    this.requestSerialCounter += 1;
+    return this.requestSerialCounter;
   }
 
   private evictColdest(protectedPageIds: ReadonlySet<number>): number | null {

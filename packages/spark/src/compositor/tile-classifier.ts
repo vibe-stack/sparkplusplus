@@ -31,7 +31,7 @@ export class SplatTileClassifier {
     viewportWidth: number,
     viewportHeight: number,
     budgets: SplatBudgetOptions,
-    tileSizePx = 96,
+    tileSizePx = 72,
   ): SplatTileClassification {
     const asset = mesh.getAsset();
     const columns = Math.max(1, Math.ceil(viewportWidth / tileSizePx));
@@ -229,10 +229,6 @@ export class SplatTileClassifier {
     this.worldCenter.set(center[0], center[1], center[2]).applyMatrix4(mesh.matrixWorld);
     this.screenPosition.copy(this.worldCenter).project(camera);
 
-    if (this.screenPosition.z < -1 || this.screenPosition.z > 1) {
-      return null;
-    }
-
     const screenX = (this.screenPosition.x * 0.5 + 0.5) * viewportWidth;
     const screenY = (this.screenPosition.y * -0.5 + 0.5) * viewportHeight;
     const screenRadius = this.getProjectedRadiusPx(
@@ -246,15 +242,18 @@ export class SplatTileClassifier {
       return null;
     }
 
-    const minTileX = Math.max(0, Math.floor((screenX - screenRadius) / tileSizePx));
+    // Expand coverage by one tile so clusters near a tile boundary or with
+    // centers just outside clip space still keep the adjacent visible tiles.
+    const tilePadding = 1;
+    const minTileX = Math.max(0, Math.floor((screenX - screenRadius) / tileSizePx) - tilePadding);
     const maxTileX = Math.min(
       Math.ceil(viewportWidth / tileSizePx) - 1,
-      Math.floor((screenX + screenRadius) / tileSizePx),
+      Math.floor((screenX + screenRadius) / tileSizePx) + tilePadding,
     );
-    const minTileY = Math.max(0, Math.floor((screenY - screenRadius) / tileSizePx));
+    const minTileY = Math.max(0, Math.floor((screenY - screenRadius) / tileSizePx) - tilePadding);
     const maxTileY = Math.min(
       Math.ceil(viewportHeight / tileSizePx) - 1,
-      Math.floor((screenY + screenRadius) / tileSizePx),
+      Math.floor((screenY + screenRadius) / tileSizePx) + tilePadding,
     );
 
     return {
