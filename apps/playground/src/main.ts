@@ -22,7 +22,8 @@ import {
   Vector3,
 } from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
-import { WebGPURenderer } from 'three/webgpu';
+import { max, oneMinus, pass, vec4 } from 'three/tsl';
+import { PostProcessing, WebGPURenderer } from 'three/webgpu';
 
 const app = document.querySelector<HTMLDivElement>('#app');
 
@@ -104,8 +105,9 @@ function isEditableTarget(target: EventTarget | null): boolean {
 }
 
 async function bootstrap(): Promise<void> {
-  const scene = new Scene();
-  scene.background = new Color(0x050814);
+  const baseScene = new Scene();
+  baseScene.background = new Color(0x050814);
+  const splatScene = new Scene();
 
   const source = await SpzSplatSource.fromUrl(`${import.meta.env.BASE_URL}demo.spz`, {
     label: 'Demo SPZ',
@@ -182,6 +184,10 @@ async function bootstrap(): Promise<void> {
     ) {
       renderer.setPixelRatio(targetPixelRatio);
       renderer.setSize(width, height, false);
+      basePass.setSize(width, height);
+      basePass.setPixelRatio(targetPixelRatio);
+      splatPass.setSize(width, height);
+      splatPass.setPixelRatio(targetPixelRatio);
       appliedPixelRatio = targetPixelRatio;
       appliedWidth = width;
       appliedHeight = height;
@@ -190,9 +196,6 @@ async function bootstrap(): Promise<void> {
     camera.aspect = width / height;
     camera.updateProjectionMatrix();
   };
-
-  window.addEventListener('resize', () => applyRendererScale(currentRenderScale));
-  applyRendererScale(1);
 
   const pressedKeys = new Set<string>();
   const baseFlightSpeed = Math.max(assetSize.length() * 0.35, 2.5);
@@ -230,11 +233,11 @@ async function bootstrap(): Promise<void> {
     pressedKeys.clear();
   });
 
-  scene.add(new AmbientLight(0xffffff, 1.1));
+  baseScene.add(new AmbientLight(0xffffff, 1.1));
 
   const sun = new DirectionalLight(0xfff4d6, 1.9);
   sun.position.set(8, 12, 6);
-  scene.add(sun);
+  baseScene.add(sun);
 
   const floor = new Mesh(
     new PlaneGeometry(Math.max(160, assetSize.x * 1.65), Math.max(120, assetSize.z * 1.65), 1, 1),
@@ -246,7 +249,7 @@ async function bootstrap(): Promise<void> {
   );
   floor.rotation.x = -Math.PI / 2;
   floor.position.y = -0.5;
-  scene.add(floor);
+  baseScene.add(floor);
 
   const heroSplat = new SplatMesh({
     source,
@@ -260,7 +263,7 @@ async function bootstrap(): Promise<void> {
     importance: 1.5,
   });
   heroSplat.position.set(-assetCenter.x, -importedAsset.localBoundsMin[1], -assetCenter.z);
-  scene.add(heroSplat);
+  splatScene.add(heroSplat);
 
   const bridge = new SplatRendererBridge({
     governor: new SplatQualityGovernor({
@@ -276,7 +279,23 @@ async function bootstrap(): Promise<void> {
     }, COMPLEX_SPLAT_PRESET.targetFrameMs),
     useGpuVisibility: COMPLEX_SPLAT_PRESET.useGpuVisibilityReadback,
   });
-  scene.add(bridge);
+  splatScene.add(bridge);
+
+  const basePass = pass(baseScene, camera);
+  const splatPass = pass(splatScene, camera, { depthBuffer: true });
+  const baseNode = basePass.getTextureNode();
+  const splatAccumulationNode = splatPass.getTextureNode();
+  const accumulationWeightNode = max(splatAccumulationNode.a, 0.0001);
+  const resolvedColorNode = splatAccumulationNode.rgb.div(accumulationWeightNode);
+  const resolvedAlphaNode = oneMinus(max(oneMinus(splatAccumulationNode.a), 0));
+  const compositeColorNode = baseNode.rgb.mul(oneMinus(resolvedAlphaNode)).add(
+    resolvedColorNode.mul(resolvedAlphaNode),
+  );
+  const postProcessing = new PostProcessing(renderer);
+  postProcessing.outputNode = vec4(compositeColorNode, 1);
+
+  window.addEventListener('resize', () => applyRendererScale(currentRenderScale));
+  applyRendererScale(1);
 
   const clock = new Clock();
 
@@ -315,9 +334,9 @@ async function bootstrap(): Promise<void> {
     }
 
     controls.update();
-    const snapshot = bridge.update(scene, camera, deltaSeconds, renderer);
+    const snapshot = bridge.update(splatScene, camera, deltaSeconds, renderer);
     applyRendererScale(snapshot.budgets.renderScale);
-    renderer.render(scene, camera);
+    postProcessing.render();
   });
 }
 

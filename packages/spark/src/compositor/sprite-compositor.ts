@@ -1,9 +1,9 @@
 import {
+  AdditiveBlending,
   Color,
   DoubleSide,
   DynamicDrawUsage,
   InstancedBufferAttribute,
-  NormalBlending,
   Sprite,
   Vector3,
 } from 'three';
@@ -318,8 +318,8 @@ export class SplatSpriteCompositor {
     material.depthWrite = false;
     material.sizeAttenuation = true;
     material.side = DoubleSide;
-    material.blending = NormalBlending;
-    material.premultipliedAlpha = true;
+    material.blending = AdditiveBlending;
+    material.premultipliedAlpha = false;
 
     return material;
   }
