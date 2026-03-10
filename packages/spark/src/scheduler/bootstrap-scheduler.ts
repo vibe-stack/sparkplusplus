@@ -92,6 +92,15 @@ export class BootstrapVisibilityScheduler {
   private readonly currentCameraForward = new Vector3();
   private hasPreviousCameraState = false;
   private cameraMotionFactor = 0;
+  // Smoothed version: rises instantly on motion, decays slowly (~15 frames to
+  // reach near-zero at 60 fps).  The raw per-frame factor drops to 0 in a
+  // single frame when the camera stops.  That instant drop reduces
+  // refinementHysteresis from ~0.92 → ~0.68 all at once, causing the entire
+  // frontier to be replaced by deep children in one frame, flooding the page
+  // table with simultaneous faults and triggering governor escalation.
+  // Smoothing spreads the transition over ~10-15 frames so page uploads keep
+  // up and the governor never sees a burst.
+  private smoothedCameraMotionFactor = 0;
 
   evaluateScene(options: {
     objects: readonly SplatSceneObjectDescriptor[];
@@ -102,7 +111,12 @@ export class BootstrapVisibilityScheduler {
     gpuVisibility?: SplatGpuVisibilityReadback;
   }): SplatSceneSelection {
     const { objects, camera, viewportHeight, frameIndex, budgets, gpuVisibility } = options;
-    this.cameraMotionFactor = this.measureCameraMotion(camera);
+    const instantMotionFactor = this.measureCameraMotion(camera);
+    this.smoothedCameraMotionFactor = Math.max(
+      instantMotionFactor,
+      this.smoothedCameraMotionFactor * 0.82,
+    );
+    this.cameraMotionFactor = this.smoothedCameraMotionFactor;
     // Always accept GPU data up to 1 frame old.  GPU readback is async and is
     // never 0-lag; requiring 0-lag during motion meant the GPU path was NEVER
     // used while the camera was moving, permanently falling back to the slower
@@ -113,6 +127,7 @@ export class BootstrapVisibilityScheduler {
       : undefined;
     const meshSelections = new Map<string, SplatMeshSelection>();
     const frontierCandidates = new Map<string, Map<number, ClusterCandidate>>();
+    const prefetchProtectedPageIds = new Map<string, Set<number>>();
     const rootCandidates: ClusterCandidate[] = [];
     const frontierBudgetState: FrontierBudgetState = {
       reservedPageSlots: 0,
@@ -139,6 +154,7 @@ export class BootstrapVisibilityScheduler {
         requestedPageIds: [],
       });
       frontierCandidates.set(mesh.uuid, new Map());
+      prefetchProtectedPageIds.set(mesh.uuid, new Set());
 
       rootCandidates.push(
         ...this.collectSeedCandidates(
@@ -183,11 +199,13 @@ export class BootstrapVisibilityScheduler {
         objects,
         camera,
         viewportHeight,
+        frameIndex,
         budgets,
         gpuVisibility: effectiveGpuVisibility,
         frontierBudgetState,
         meshSelections,
         frontierCandidates,
+        prefetchProtectedPageIds,
       });
     }
 
@@ -213,9 +231,13 @@ export class BootstrapVisibilityScheduler {
         }
 
         const selection = meshSelections.get(descriptor.mesh.uuid)!;
+        const protectedPageIds = new Set([
+          ...selection.activePageIds,
+          ...(prefetchProtectedPageIds.get(descriptor.mesh.uuid) ?? []),
+        ]);
         const uploaded = descriptor.mesh
           .getPageTable()
-          .serviceRequests(1, frameIndex, new Set(selection.activePageIds));
+          .serviceRequests(1, frameIndex, protectedPageIds);
 
         if (uploaded.length > 0) {
           pageUploads += uploaded.length;
@@ -323,6 +345,24 @@ export class BootstrapVisibilityScheduler {
     }
 
     selection.requestedPageIds = [...requestedPageIds];
+
+    // Keep root-cluster pages permanently warm in the LRU.
+    // Root pages are the last-resort fallback for every non-resident frontier
+    // cluster.  When the frontier advances to deep clusters (e.g. once the GPU
+    // path takes over after the camera settles), root pages stop being touched
+    // and are eventually evicted by evictColdest.  Without this guard,
+    // findResidentFallbackClusterId can walk all the way to a root that is no
+    // longer resident and return null, producing a tile hole with no content.
+    for (const rootClusterId of asset.rootClusterIds) {
+      const rootCluster = asset.clusters[rootClusterId]!;
+      const rootPage = asset.pages[rootCluster.pageId]!;
+
+      if (pageTable.isResident(rootPage.id)) {
+        pageTable.markTouched(rootPage.id, frameIndex);
+      } else {
+        pageTable.request(rootPage.id, frameIndex);
+      }
+    }
   }
 
   private activateResidentCluster(
@@ -514,72 +554,41 @@ export class BootstrapVisibilityScheduler {
     gpuVisibility?: SplatGpuVisibilityReadback,
   ): ClusterCandidate[] {
     const asset = descriptor.mesh.getAsset();
-    const previousFrontier = descriptor.mesh.getPreviousFrontierClusterIds();
-
-    if (previousFrontier.length === 0 || this.cameraMotionFactor > 0.22) {
-      return asset.rootClusterIds
-        .map((clusterId) =>
-          this.scoreCandidate(descriptor, clusterId, camera, viewportHeight, pageTable, budgets, gpuVisibility),
-        )
-        .filter((candidate): candidate is ClusterCandidate => candidate !== null);
-    }
-
-    const seededRoots = new Set<number>();
-    const seeds = previousFrontier
+    // Always reseed the CPU frontier from roots. Reusing the previous frontier
+    // as the seed can strand visible sibling regions once one descendant under
+    // a root survives scoring, which manifests as in-view tiles disappearing
+    // exactly when the camera settles. Temporal history is still consumed later
+    // via temporalWeight and pinned-descendant checks.
+    return asset.rootClusterIds
       .map((clusterId) =>
         this.scoreCandidate(descriptor, clusterId, camera, viewportHeight, pageTable, budgets, gpuVisibility),
       )
-      .filter((candidate): candidate is ClusterCandidate => {
-        if (candidate === null) {
-          return false;
-        }
-
-        seededRoots.add(this.getRootClusterId(candidate.clusterId, asset));
-        return true;
-      });
-
-    for (const rootClusterId of asset.rootClusterIds) {
-      if (seededRoots.has(rootClusterId)) {
-        continue;
-      }
-
-      const rootCandidate = this.scoreCandidate(
-        descriptor,
-        rootClusterId,
-        camera,
-        viewportHeight,
-        pageTable,
-        budgets,
-        gpuVisibility,
-      );
-
-      if (rootCandidate) {
-        seeds.push(rootCandidate);
-      }
-    }
-
-    return seeds;
+      .filter((candidate): candidate is ClusterCandidate => candidate !== null);
   }
 
   private refineFrontier(options: {
     objects: readonly SplatSceneObjectDescriptor[];
     camera: Camera,
     viewportHeight: number,
+    frameIndex: number,
     budgets: SplatBudgetOptions,
     gpuVisibility: SplatGpuVisibilityReadback | undefined,
     frontierBudgetState: FrontierBudgetState,
     meshSelections: Map<string, SplatMeshSelection>,
     frontierCandidates: Map<string, Map<number, ClusterCandidate>>;
+    prefetchProtectedPageIds: Map<string, Set<number>>;
   }): void {
     const {
       objects,
       camera,
       viewportHeight,
+      frameIndex,
       budgets,
       gpuVisibility,
       frontierBudgetState,
       meshSelections,
       frontierCandidates,
+      prefetchProtectedPageIds,
     } = options;
 
     let madeProgress = true;
@@ -624,42 +633,47 @@ export class BootstrapVisibilityScheduler {
             continue;
           }
 
+          this.requestRefinementChildren(
+            children,
+            asset,
+            pageTable,
+            frameIndex,
+            prefetchProtectedPageIds.get(mesh.uuid)!,
+          );
+
+          if (!this.areReplacementChildrenResident(children, asset, pageTable)) {
+            continue;
+          }
+
+          // Replacing a parent with only a high-scoring subset of its children
+          // leaves the omitted siblings with no frontier coverage, which shows
+          // up as tiles disappearing after motion settles.  Only promote a
+          // parent when the full visible/scorable child set can replace it.
           let accumulatedScore = 0;
           let accumulatedVisibleCost = 0;
           let accumulatedOverdraw = 0;
-          const targetSubsetSize = Math.max(
-            2,
-            Math.ceil(parent.projectedSizePx / Math.max(1, budgets.minProjectedNodeSizePx * 1.35)),
-          );
-          const maxSubsetSize = Math.min(children.length, targetSubsetSize);
 
-          for (let subsetSize = 1; subsetSize <= maxSubsetSize; subsetSize += 1) {
-            const child = children[subsetSize - 1]!;
+          for (const child of children) {
             accumulatedScore += child.score;
             accumulatedVisibleCost += child.visibleCost;
             accumulatedOverdraw += this.getCandidateOverdraw(child);
-
-            if (subsetSize === 1 && children.length > 1) {
-              continue;
-            }
-
-            const selectedChildren = children.slice(0, subsetSize);
-            refinementOptions.push({
-              descriptor,
-              parent,
-              children: selectedChildren,
-              deltaPageSlots: selectedChildren.length - 1,
-              deltaVisibleSplats: accumulatedVisibleCost - parent.visibleCost,
-              deltaOverdraw: accumulatedOverdraw - this.getCandidateOverdraw(parent),
-              priority: accumulatedScore
-                - parent.score
-                + parent.projectedSizePx * 0.05
-                + Math.log2(
-                  Math.max(1, parent.representedSplatCount / Math.max(1, parent.proxySplatCount)),
-                ) * parent.projectedSizePx * 0.08
-                + subsetSize * 0.12,
-            });
           }
+
+          refinementOptions.push({
+            descriptor,
+            parent,
+            children,
+            deltaPageSlots: children.length - 1,
+            deltaVisibleSplats: accumulatedVisibleCost - parent.visibleCost,
+            deltaOverdraw: accumulatedOverdraw - this.getCandidateOverdraw(parent),
+            priority: accumulatedScore
+              - parent.score
+              + parent.projectedSizePx * 0.05
+              + Math.log2(
+                Math.max(1, parent.representedSplatCount / Math.max(1, parent.proxySplatCount)),
+              ) * parent.projectedSizePx * 0.08
+              + children.length * 0.12,
+          });
         }
       }
 
@@ -706,6 +720,28 @@ export class BootstrapVisibilityScheduler {
     const representationGap = candidate.representedSplatCount / Math.max(1, candidate.proxySplatCount);
     const detailPressure = Math.min(1.8, 1 + Math.log2(Math.max(1, representationGap)) * 0.18);
     return candidate.projectedSizePx * detailPressure > budgets.minProjectedNodeSizePx * refinementHysteresis;
+  }
+
+  private requestRefinementChildren(
+    children: readonly ClusterCandidate[],
+    asset: ReturnType<SplatSceneObjectDescriptor['mesh']['getAsset']>,
+    pageTable: ReturnType<SplatSceneObjectDescriptor['mesh']['getPageTable']>,
+    frameIndex: number,
+    protectedPageIds: Set<number>,
+  ): void {
+    for (const child of children) {
+      const childPageId = asset.clusters[child.clusterId]!.pageId;
+      protectedPageIds.add(childPageId);
+      pageTable.request(childPageId, frameIndex);
+    }
+  }
+
+  private areReplacementChildrenResident(
+    children: readonly ClusterCandidate[],
+    asset: ReturnType<SplatSceneObjectDescriptor['mesh']['getAsset']>,
+    pageTable: ReturnType<SplatSceneObjectDescriptor['mesh']['getPageTable']>,
+  ): boolean {
+    return children.every((child) => pageTable.isResident(asset.clusters[child.clusterId]!.pageId));
   }
 
   private hasPinnedDescendant(

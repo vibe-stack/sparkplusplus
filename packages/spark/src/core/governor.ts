@@ -14,6 +14,16 @@ export class SplatQualityGovernor {
   private level = 0;
   private reason = 'bootstrap';
   private stableFrames = 0;
+  // Refinement and page uploads can temporarily spike CPU time for a handful
+  // of frames right when the camera settles. Reacting to a single spike turns
+  // a transient catch-up cost into a persistent quality collapse.
+  private consecutiveOverloadedFrames = 0;
+  // Page-fault spikes are expected for 1-2 frames whenever the frontier
+  // transitions to a finer LOD level (e.g. when the camera settles and
+  // refineFrontier pushes to deeper clusters).  Escalating on the very first
+  // spike frame turns a transient loading burst into a permanent quality
+  // regression.  Require 3 consecutive spike frames before escalating.
+  private consecutiveFaultFrames = 0;
 
   constructor(
     baseBudgets: Partial<SplatBudgetOptions> = {},
@@ -39,22 +49,49 @@ export class SplatQualityGovernor {
   }
 
   observe(snapshot: SplatFrameStatsSnapshot): SplatQualityDecision {
-    const overloadedFrame = snapshot.cpuFrameMs > this.targetFrameMs * 1.15;
-    const pageFaultSpike = snapshot.pageFaultRate > 0.35;
-    const overdrawPressure = snapshot.estimatedOverdraw > snapshot.budgets.maxOverdrawBudget * 0.92;
+    const refinementTransition = snapshot.pageUploads > 0 || snapshot.frontierStability < 0.92;
+    if (!refinementTransition && snapshot.cpuFrameMs > this.targetFrameMs * 1.25) {
+      this.consecutiveOverloadedFrames += 1;
+    } else {
+      this.consecutiveOverloadedFrames = 0;
+    }
+    const overloadedFrame = this.consecutiveOverloadedFrames >= 3;
+    if (!refinementTransition && snapshot.pageFaultRate > 0.35) {
+      this.consecutiveFaultFrames += 1;
+    } else {
+      this.consecutiveFaultFrames = 0;
+    }
+    const pageFaultSpike = this.consecutiveFaultFrames >= 3;
+    // Use 1.45× instead of 0.92× as the escalation threshold.
+    // canReplaceFrontierCandidate deliberately allows estimatedOverdraw to reach
+    // up to 1.6× maxOverdrawBudget at close-up range (via closeUpFactor).  With
+    // the old 0.92 threshold the governor triggered overdraw escalation on
+    // virtually every close-up frame, racing to level 5-6 and raising
+    // minProjectedNodeSizePx / shrinking maxResidentPages, which caused the
+    // very holes and detail loss the user experiences when zoomed in.
+    const overdrawPressure = snapshot.estimatedOverdraw > snapshot.budgets.maxOverdrawBudget * 1.45;
 
     if (overloadedFrame || pageFaultSpike || overdrawPressure) {
-      this.level = Math.min(this.level + 1, 7);
-      this.reason = overloadedFrame
+      const nextReason = overloadedFrame
         ? 'cpu frame pressure'
         : pageFaultSpike
           ? 'page fault pressure'
           : 'overdraw pressure';
+      const nextLevelCap = nextReason === 'overdraw pressure' ? 7 : 4;
+      this.level = Math.min(this.level + 1, nextLevelCap);
+      this.reason = nextReason;
       this.stableFrames = 0;
+      this.consecutiveOverloadedFrames = 0;
+      if (nextReason === 'page fault pressure') {
+        this.consecutiveFaultFrames = 0;
+      }
     } else {
       this.stableFrames += 1;
 
-      if (this.stableFrames >= 90 && this.level > 0) {
+      // 45 frames (~0.75 s at 60 fps) instead of 90: governor transients from
+      // close-up zoom-in or page-fault spikes should recover within one second
+      // once the camera settles, not after a full 1.5 second window.
+      if (this.stableFrames >= 45 && this.level > 0) {
         this.level -= 1;
         this.reason = 'recovered headroom';
         this.stableFrames = 0;
